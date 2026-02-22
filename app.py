@@ -2,6 +2,30 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 
+import streamlit as st
+
+def require_password():
+    pw = st.secrets.get("APP_PASSWORD", "")
+    if not pw:
+        st.warning("APP_PASSWORD not set in Streamlit Secrets.")
+        st.stop()
+
+    if "authed" not in st.session_state:
+        st.session_state.authed = False
+
+    if not st.session_state.authed:
+        st.title("Kapi Test Pilot")
+        entered = st.text_input("Enter password", type="password")
+        if st.button("Login"):
+            if entered == pw:
+                st.session_state.authed = True
+                st.rerun()
+            else:
+                st.error("Wrong password")
+        st.stop()
+
+require_password()
+
 st.set_page_config(page_title="Kapi Test Pilot", layout="wide")
 
 st.title("Kapi Test Pilot — Form 5500 Pilot Dashboard")
