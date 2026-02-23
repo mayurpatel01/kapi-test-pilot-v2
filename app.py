@@ -235,7 +235,92 @@ tabs = st.tabs([
     "Data QA / Methods",
 ])
 
+# ============================================================
+# MAIN PAGE AI ANALYST (always visible)
+# ============================================================
+st.markdown("## 🤖 AI Analyst (always available)")
+st.caption("Ask: 'Top 10 recommended actions', 'Which brokers have biggest LTD white space?', 'Carrier LTD white space targets', 'M&A roll-up targets'.")
 
+if "chat" not in st.session_state:
+    st.session_state.chat = []
+
+# Show last messages (compact)
+with st.expander("Open AI Analyst Chat", expanded=True):
+    for msg in st.session_state.chat[-8:]:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    user_q = st.chat_input("Ask the AI analyst… (always available)")
+    if user_q:
+        st.session_state.chat.append({"role": "user", "content": user_q})
+
+        ql = user_q.lower()
+        response_lines = []
+
+        # helper
+        def _money(x: float) -> str:
+            try:
+                return f"${float(x):,.0f}"
+            except Exception:
+                return "$0"
+
+        # ROUTES (same logic as your AI Analyst tab, condensed)
+        if "recommended actions" in ql or ("top 10" in ql and "action" in ql):
+            top10 = broker_ai.head(10)
+            response_lines.append("### Top 10 Recommended Actions (CEO view)")
+            for i, r in enumerate(top10.itertuples(index=False), start=1):
+                response_lines.append(
+                    f"**{i}. Target {r.Broker}** — {int(r.employers):,} employers • "
+                    f"Opp: **{float(r.opp_score):,.1f}** • "
+                    f"Impact: **{_money(float(r.rev_impact_low))} – {_money(float(r.rev_impact_high))}** "
+                    f"(base {_money(float(r.rev_impact_base))})"
+                )
+            response_lines.append(
+                f"\nModel: wins = opp_score × conversion ({conversion_rate:.0%}); "
+                f"per-win ≈ median_comm_norm × uplift ({uplift_multiplier:.1f})."
+            )
+
+        elif "broker" in ql and ("opportunity" in ql or "white space" in ql or "gap" in ql):
+            view = broker_ai.sort_values("opp_score", ascending=False).head(10)[
+                ["Broker", "employers", "opp_score", "opp_per_100_employers", "rev_impact_base", "hhi_concentration"]
+            ]
+            response_lines.append("### Top brokers by cross-sell opportunity")
+            response_lines.append(view.to_markdown(index=False))
+            response_lines.append("\nInterpretation: target high opp + reasonable concentration (lower HHI).")
+
+        elif "carrier" in ql and ("ltd" in ql or "white space" in ql or "imbalance" in ql):
+            view = carrier_ai.sort_values("whitespace_ltd", ascending=False).head(10)[
+                ["Carrier", "total_emp", "Life_emp", "LTD_emp", "whitespace_ltd", "imbalance_score"]
+            ]
+            response_lines.append("### Top carriers by LTD white space (Life-heavy, low LTD)")
+            response_lines.append(view.to_markdown(index=False))
+
+        elif "m&a" in ql or "acquisition" in ql or "roll-up" in ql:
+            broker_ma = broker_ai.copy()
+            broker_ma["ma_score"] = (
+                zscore(broker_ma["comm_norm_sum"]) * 0.40
+                + zscore(broker_ma["employers"]) * 0.25
+                + zscore(broker_ma["opp_score"]) * 0.35
+                - zscore(broker_ma["hhi_concentration"]) * 0.40
+            )
+            view = broker_ma.sort_values("ma_score", ascending=False).head(10)[
+                ["Broker", "employers", "comm_norm_sum", "opp_score", "hhi_concentration", "ma_score"]
+            ]
+            response_lines.append("### Broker roll-up targets (pilot heuristic)")
+            response_lines.append(view.to_markdown(index=False))
+
+        else:
+            response_lines.append(
+                "Try:\n"
+                "- **Top 10 recommended actions**\n"
+                "- **Top brokers by LTD white space**\n"
+                "- **Top carriers by LTD white space**\n"
+                "- **M&A roll-up targets**"
+            )
+
+        assistant_content = "\n\n".join(response_lines)
+        st.session_state.chat.append({"role": "assistant", "content": assistant_content})
+        st.rerun()
 # ============================================================
 # 7) Core computed views (cached)
 # ============================================================
@@ -400,6 +485,41 @@ carrier_ai = build_carrier_ai(epc_f, concentration_penalty)
 # ============================================================
 with tabs[0]:
     st.subheader("Executive Overview")
+
+    # ============================================================
+# STRATEGIC BRIEF (Decision Engine Layer)
+# ============================================================
+st.markdown("### 🧠 Strategic Brief (Auto-generated)")
+
+top_b = broker_ai.head(1).iloc[0]
+top_c = carrier_ai.head(1).iloc[0]
+
+# Portfolio-wide opportunity sizing (pilot)
+total_opp = float(broker_ai["opp_score"].sum())
+expected_wins_total = total_opp * float(conversion_rate)
+impact_total_base = expected_wins_total * float(median_comm_norm) * float(uplift_multiplier)
+
+brief = f"""
+**What we’re seeing**
+- The biggest growth lever is **disability expansion (especially LTD)** inside broker books that already place Life.
+- Commission data contains extreme outliers, so rankings use **normalized commissions (capped at {cap_mode})**.
+
+**What it means**
+- The most actionable path is targeting brokers with: **high LTD gap density**, **large employer footprint**, and **low concentration risk**.
+- Carrier strategy: the highest white-space carriers show **Life-heavy footprint with low LTD penetration**.
+
+**What to do next (next 30 days)**
+1) Start with **{top_b['Broker']}** (highest CEO score): focus on employers missing LTD/STD; estimated base upside **${top_b['rev_impact_base']:,.0f}**.
+2) Replicate playbook across the **Top 10 brokers** (ranked by CEO score) to scale impact.
+3) For carrier partnerships, prioritize **{top_c['Carrier']}** (highest CEO score) where LTD white space is highest.
+
+**Scenario-based upside (portfolio)**
+- Total weighted opportunity score: **{total_opp:,.0f}**
+- Expected wins (score × conversion): **{expected_wins_total:,.0f}**
+- Estimated incremental commissions (base): **${impact_total_base:,.0f}**
+"""
+
+st.info(brief)
 
     left, right = st.columns([1, 1])
 
