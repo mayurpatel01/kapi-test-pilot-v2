@@ -133,7 +133,7 @@ for col in ["Life", "STD", "LTD"]:
 # ============================================================
 # 4) Sidebar controls (CEO controls)
 # ============================================================
-st.title("🧭 Test Pilot — CEO Opportunity Intelligence (Form 5500)")
+st.title("🧭 Test Pilot — Intelligence Insights (Form 5500)")
 st.caption(
     "Decision-engine style prioritization built from Form 5500 marts: "
     "cross-sell gaps, carrier white space, and M&A heuristics. "
