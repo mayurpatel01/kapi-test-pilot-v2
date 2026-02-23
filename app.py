@@ -105,6 +105,19 @@ epc = ensure_str(load_parquet("employer_product_carrier.parquet"))      # Employ
 ebc = ensure_str(load_parquet("employer_broker_commissions.parquet"))   # Employer x Broker (+ total_commissions)
 gaps = ensure_str(load_parquet("employer_product_matrix.parquet"))      # Employer x Life/STD/LTD flags
 
+# Load geo mart
+geo = ensure_str(load_parquet("employer_geo.parquet"))
+
+# Keep only needed geo fields
+geo = geo[["Employer", "State", "ZIP", "City"]]
+
+# Merge geo into gaps dataset (primary modeling table)
+gaps = gaps.merge(geo, on="Employer", how="left")
+
+# (Optional but recommended) also merge into epc and ebc for flexibility later
+epc = epc.merge(geo, on="Employer", how="left")
+ebc = ebc.merge(geo, on="Employer", how="left")
+
 # Numeric cleanup
 if "Covered_Lives" in epc.columns:
     epc["Covered_Lives"] = pd.to_numeric(epc["Covered_Lives"], errors="coerce").fillna(0.0)
@@ -190,6 +203,39 @@ ebc_f = filter_by_employer(ebc)
 gaps_f = filter_by_employer(gaps)
 
 epc_p = epc_f[epc_f["Product"] == product_view].copy()
+
+import plotly.express as px
+
+st.subheader("Employer Footprint by State")
+
+state_counts = (
+    gaps.dropna(subset=["State"])
+        .groupby("State", as_index=False)
+        .agg(Employers=("Employer", "nunique"))
+)
+
+fig = px.choropleth(
+    state_counts,
+    locations="State",
+    locationmode="USA-states",
+    color="Employers",
+    scope="usa",
+)
+
+st.plotly_chart(fig, use_container_width=True)
+
+st.subheader("Top Cities by Employer Count")
+
+city_counts = (
+    gaps.dropna(subset=["City", "State"])
+        .assign(CityState=lambda d: d["City"].str.title() + ", " + d["State"])
+        .groupby("CityState", as_index=False)
+        .agg(Employers=("Employer", "nunique"))
+        .sort_values("Employers", ascending=False)
+        .head(25)
+)
+
+st.dataframe(city_counts, use_container_width=True)
 
 
 # ============================================================
