@@ -14,7 +14,7 @@ COLS = {
 }
 
 def norm_name(s: str) -> str:
-    if pd.isna(s):
+    if s is None or (isinstance(s, float) and pd.isna(s)):
         return ""
     s = str(s).upper().strip()
     s = re.sub(r"[^\w\s]", " ", s)
@@ -24,62 +24,108 @@ def norm_name(s: str) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
-def mode_value(s):
-    s = s.dropna()
-    s = s[s.astype(str).str.strip() != ""]
-    if len(s) == 0:
+def clean_zip(z):
+    if z is None:
         return ""
-    return s.value_counts().index[0]
+    z = re.sub(r"\D", "", str(z))
+    z = (z + "00000")[:5]  # pad then cut
+    return z
+
+def clean_ein(e):
+    if e is None:
+        return ""
+    e = re.sub(r"\D", "", str(e))
+    e = ("000000000" + e)[-9:]
+    return e
 
 def main():
-
     print("Loading employer universe from existing mart...")
     gaps = pd.read_parquet(DATA_MARTS / "employer_product_matrix.parquet")
+    employers = gaps[["Employer"]].drop_duplicates()
+    employers["employer_key"] = employers["Employer"].apply(norm_name)
 
-    employer_universe = gaps[["Employer"]].drop_duplicates()
-    employer_universe["employer_key"] = employer_universe["Employer"].apply(norm_name)
+    employer_keys = set(employers["employer_key"].tolist())
+    print(f"Employer universe: {len(employers):,}")
 
-    print("Reading Form 5500 main file...")
-    df = pd.read_csv(
+    usecols = list(COLS.values())
+    rename_map = {v: k for k, v in COLS.items()}
+
+    # We'll store best guess per employer_key as we stream
+    # Using "first non-empty" (fast) — later we can switch to "mode" if needed
+    best = {}
+
+    print("Streaming Form 5500 main file in chunks...")
+    chunk_size = 250_000
+    matched_rows = 0
+    chunk_idx = 0
+
+    reader = pd.read_csv(
         RAW_FILE,
         sep=",",
         dtype=str,
-        usecols=list(COLS.values()),
-        low_memory=False
+        usecols=usecols,
+        chunksize=chunk_size,
+        low_memory=False,
     )
 
-    df = df.rename(columns={v: k for k, v in COLS.items()})
-    df["employer_key"] = df["employer_name"].apply(norm_name)
+    for chunk in reader:
+        chunk_idx += 1
+        if chunk_idx % 1 == 0:
+            print(f"  - chunk {chunk_idx:,} ...")
 
-    df["state"] = df["state"].fillna("").str.strip().str.upper()
-    df["zip"] = df["zip"].fillna("").str.replace(r"\D", "", regex=True).str.zfill(5).str[:5]
-    df["city"] = df["city"].fillna("").str.strip()
-    df["ein"] = df["ein"].fillna("").str.replace(r"\D", "", regex=True).str.zfill(9).str[-9:]
+        chunk = chunk.rename(columns=rename_map)
+        chunk["employer_key"] = chunk["employer_name"].apply(norm_name)
 
-    grouped = df.groupby("employer_key", as_index=False).agg({
-        "state": mode_value,
-        "zip": mode_value,
-        "city": mode_value,
-        "ein": mode_value
-    })
+        # Keep only employers that exist in your marts (massive speed-up)
+        chunk = chunk[chunk["employer_key"].isin(employer_keys)]
+        if chunk.empty:
+            continue
 
-    geo = employer_universe.merge(grouped, on="employer_key", how="left")
+        matched_rows += len(chunk)
 
-    out = geo[["Employer", "state", "zip", "city", "ein"]].rename(columns={
-        "state": "State",
-        "zip": "ZIP",
-        "city": "City",
-        "ein": "EIN"
-    })
+        # Clean geo fields
+        chunk["state"] = chunk["state"].fillna("").astype(str).str.strip().str.upper()
+        chunk["zip"] = chunk["zip"].apply(clean_zip)
+        chunk["city"] = chunk["city"].fillna("").astype(str).str.strip()
+        chunk["ein"] = chunk["ein"].apply(clean_ein)
 
-    output_path = DATA_MARTS / "employer_geo.parquet"
-    out.to_parquet(output_path, index=False)
+        # Fill best dict (first non-empty values)
+        for r in chunk.itertuples(index=False):
+            k = r.employer_key
+            if k not in best:
+                best[k] = {"state": "", "zip": "", "city": "", "ein": ""}
+            if not best[k]["state"] and r.state:
+                best[k]["state"] = r.state
+            if not best[k]["zip"] and r.zip and r.zip != "00000":
+                best[k]["zip"] = r.zip
+            if not best[k]["city"] and r.city:
+                best[k]["city"] = r.city
+            if not best[k]["ein"] and r.ein and r.ein != "000000000":
+                best[k]["ein"] = r.ein
+
+        # Optional early stop if we’ve resolved almost all employers
+        if len(best) >= int(len(employers) * 0.98):
+            print("  - Reached 98% employer coverage; stopping early.")
+            break
+
+    print(f"Chunks processed: {chunk_idx:,}")
+    print(f"Matched sponsor rows: {matched_rows:,}")
+    print(f"Employers with geo found: {len(best):,}")
+
+    geo_rows = []
+    for k, v in best.items():
+        geo_rows.append((k, v["state"], v["zip"], v["city"], v["ein"]))
+
+    geo = pd.DataFrame(geo_rows, columns=["employer_key","State","ZIP","City","EIN"])
+    out = employers.merge(geo, on="employer_key", how="left")[["Employer","State","ZIP","City","EIN"]]
+
+    out_path = DATA_MARTS / "employer_geo.parquet"
+    out.to_parquet(out_path, index=False)
 
     print("\nSUCCESS.")
-    print("File written to:", output_path)
-    print("Total employers:", len(out))
-    print("State coverage %:", (out["State"] != "").mean())
-    print("ZIP coverage %:", (out["ZIP"] != "").mean())
+    print("Wrote:", out_path)
+    print("State coverage %:", (out["State"].fillna("") != "").mean())
+    print("ZIP coverage %:", (out["ZIP"].fillna("") != "").mean())
 
 if __name__ == "__main__":
     main()
