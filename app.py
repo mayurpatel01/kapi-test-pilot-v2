@@ -1,6 +1,7 @@
 # app.py
 # Voluntary Benefits Intelligence Insights (Form 5500)
 # Streamlit: AON Composite filter + heatmaps + ZIP intelligence + gap matrix
+# FIX: Removed st.stop() inside tabs (ZIP tab no longer prevents other tabs from rendering)
 
 import os
 import re
@@ -270,7 +271,7 @@ if state_filter and "State" in gaps_base.columns:
 
 
 # =========================
-# ZIP-filtered view (optional)
+# ZIP-filtered view (optional for entire dashboard)
 # =========================
 gaps_view, epc_view, ebc_view = gaps_base, epc_base, ebc_base
 
@@ -336,15 +337,10 @@ with tab_lens:
     c3.metric("Cities", f"{gaps_view['City'].nunique():,}" if "City" in gaps_view.columns else "—")
     c4.metric("AON Footprint", "ON" if aon_only else "OFF")
 
-    # Map
     st.markdown("### Employer footprint by State")
     if "State" in gaps_view.columns and gaps_view["State"].notna().any():
         tmp = gaps_view.copy()
         tmp["StateNorm"] = tmp["State"].apply(normalize_state)
-
-        bad = sorted(set(tmp["StateNorm"].dropna().unique()) - VALID_STATES)
-        if bad:
-            st.warning(f"Unrecognized state values (sample): {bad[:15]}")
 
         by_state = (
             tmp[tmp["StateNorm"].isin(VALID_STATES)]
@@ -363,7 +359,6 @@ with tab_lens:
     else:
         st.info("State not available (geo missing). Set EMPLOYER_GEO_URL in Secrets to enable maps.")
 
-    # Top Cities (hide index / remove blank first column)
     st.markdown("### Top Cities")
     if "City" in gaps_view.columns and "State" in gaps_view.columns:
         city_counts = (
@@ -375,9 +370,6 @@ with tab_lens:
             .head(25)
             .reset_index(drop=True)
         )
-
-        # If your Streamlit version supports hide_index, you can swap to:
-        # st.dataframe(city_counts, use_container_width=True, hide_index=True)
         st.dataframe(city_counts, use_container_width=True)
     else:
         st.info("City/State not available (geo missing).")
@@ -442,151 +434,147 @@ with tab_radar:
 
 
 # =========================
-# ZIP Intelligence (its own tab, no confusion)
+# ZIP Intelligence (no st.stop; does not block other tabs)
 # =========================
 with tab_zip:
     st.subheader("ZIP Intelligence")
-    st.caption("This tab always evaluates the ZIP you entered. Use 'Apply ZIP filter to all dashboards' if you want Lens/Radar/Gaps to also filter to the ZIP.")
+    st.caption(
+        "This tab evaluates the ZIP you entered. Turn ON 'Apply ZIP filter to all dashboards' if you want Lens/Radar/Gaps to also filter to the ZIP."
+    )
 
     if not zip_query:
-        st.info("Enter a 5-digit ZIP in the sidebar.")
-        st.stop()
-
-    if "ZIP" not in gaps_base.columns:
+        st.info("Enter a 5-digit ZIP in the sidebar to generate intelligence.")
+    elif "ZIP" not in gaps_base.columns:
         st.warning("ZIP not available (geo missing). Set EMPLOYER_GEO_URL in Secrets.")
-        st.stop()
+    else:
+        gz = gaps_base[gaps_base["ZIP"].astype(str) == zip_query].copy()
+        ez = ebc_base[ebc_base["ZIP"].astype(str) == zip_query].copy() if "ZIP" in ebc_base.columns else ebc_base.iloc[0:0].copy()
+        pz = epc_base[epc_base["ZIP"].astype(str) == zip_query].copy() if "ZIP" in epc_base.columns else epc_base.iloc[0:0].copy()
 
-    gz = gaps_base[gaps_base["ZIP"].astype(str) == zip_query].copy()
-    ez = ebc_base[ebc_base["ZIP"].astype(str) == zip_query].copy() if "ZIP" in ebc_base.columns else ebc_base.iloc[0:0].copy()
-    pz = epc_base[epc_base["ZIP"].astype(str) == zip_query].copy() if "ZIP" in epc_base.columns else epc_base.iloc[0:0].copy()
+        if gz.empty:
+            st.warning("No employers found for this ZIP under the current base filters (AON toggle / employer search / state filter).")
+        else:
+            lf = as_flag(gz[life_col])
+            sf = as_flag(gz[std_col])
+            tf = as_flag(gz[ltd_col])
+            dis = sf | tf
 
-    if gz.empty:
-        st.warning("No employers found for this ZIP in the current base filters (AON toggle / employer search / state filter).")
-        st.stop()
+            gz["Expandable_Life_to_Disability"] = lf & (~dis)
+            gz["Expandable_Disability_to_Life"] = dis & (~lf)
+            gz["Bundled"] = lf & dis
 
-    lf = as_flag(gz[life_col])
-    sf = as_flag(gz[std_col])
-    tf = as_flag(gz[ltd_col])
-    dis = sf | tf
+            n_emps = int(gz["Employer"].nunique())
+            n_life_to_dis = int(gz["Expandable_Life_to_Disability"].sum())
+            n_dis_to_life = int(gz["Expandable_Disability_to_Life"].sum())
+            n_bundled = int(gz["Bundled"].sum())
 
-    gz["Expandable_Life_to_Disability"] = lf & (~dis)
-    gz["Expandable_Disability_to_Life"] = dis & (~lf)
-    gz["Bundled"] = lf & dis
+            brokers_n = int(ez["Broker"].nunique()) if ("Broker" in ez.columns and not ez.empty) else 0
+            frag = (brokers_n / n_emps) if n_emps else 0.0
 
-    n_emps = int(gz["Employer"].nunique())
-    n_life_to_dis = int(gz["Expandable_Life_to_Disability"].sum())
-    n_dis_to_life = int(gz["Expandable_Disability_to_Life"].sum())
-    n_bundled = int(gz["Bundled"].sum())
+            total_comm = float(pd.to_numeric(ez["total_commissions"], errors="coerce").fillna(0).sum()) if ("total_commissions" in ez.columns and not ez.empty) else 0.0
+            comm_per_emp = (total_comm / n_emps) if n_emps else 0.0
 
-    brokers_n = int(ez["Broker"].nunique()) if ("Broker" in ez.columns and not ez.empty) else 0
-    frag = (brokers_n / n_emps) if n_emps else 0.0
+            carrier_col = None
+            for c in pz.columns:
+                if c.lower() == "carrier" or "carrier" in c.lower():
+                    carrier_col = c
+                    break
+            carriers_n = int(pz[carrier_col].nunique()) if (carrier_col and not pz.empty) else 0
 
-    total_comm = float(pd.to_numeric(ez["total_commissions"], errors="coerce").fillna(0).sum()) if ("total_commissions" in ez.columns and not ez.empty) else 0.0
-    comm_per_emp = (total_comm / n_emps) if n_emps else 0.0
+            st.markdown(f"### ZIP: **{zip_query}**")
+            k1, k2, k3, k4, k5 = st.columns(5)
+            k1.metric("Employers", f"{n_emps:,}")
+            k2.metric("Expandable: Life → Dis", f"{n_life_to_dis:,}")
+            k3.metric("Expandable: Dis → Life", f"{n_dis_to_life:,}")
+            k4.metric("Distinct brokers", f"{brokers_n:,}")
+            k5.metric("Total commissions", f"${total_comm:,.0f}")
 
-    carrier_col = None
-    for c in pz.columns:
-        if c.lower() == "carrier" or "carrier" in c.lower():
-            carrier_col = c
-            break
-    carriers_n = int(pz[carrier_col].nunique()) if (carrier_col and not pz.empty) else 0
+            st.markdown("### Opportunity & Risk Signals")
+            signals = []
 
-    st.markdown(f"### ZIP: **{zip_query}**")
-    k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("Employers", f"{n_emps:,}")
-    k2.metric("Expandable: Life → Dis", f"{n_life_to_dis:,}")
-    k3.metric("Expandable: Dis → Life", f"{n_dis_to_life:,}")
-    k4.metric("Distinct brokers", f"{brokers_n:,}")
-    k5.metric("Total commissions", f"${total_comm:,.0f}")
+            if n_emps < 10:
+                signals.append("**Low signal density:** small employer count in this ZIP. Treat as directional, not definitive.")
 
-    st.markdown("### Opportunity & Risk Signals")
-    signals = []
+            if n_life_to_dis >= max(3, int(0.15 * n_emps)):
+                signals.append(
+                    f"**Bundling whitespace (Life → Disability):** {n_life_to_dis:,} employers have Life without STD/LTD. "
+                    "Clean candidate pool for disability attach strategies."
+                )
 
-    if n_emps < 10:
-        signals.append("**Low signal density:** small employer count in this ZIP. Treat as directional, not definitive.")
+            if n_dis_to_life >= max(3, int(0.15 * n_emps)):
+                signals.append(
+                    f"**Adjacency whitespace (Disability → Life):** {n_dis_to_life:,} employers have disability without Life. "
+                    "Candidate pool for Life attach depending on segment fit."
+                )
 
-    if n_life_to_dis >= max(3, int(0.15 * n_emps)):
-        signals.append(
-            f"**Bundling whitespace (Life → Disability):** {n_life_to_dis:,} employers have Life without STD/LTD. "
-            "This is a clean candidate pool for disability attach strategies."
-        )
+            if n_bundled >= max(5, int(0.30 * n_emps)):
+                signals.append(
+                    f"**Bundling norm present:** {n_bundled:,} employers already bundle Life+Disability. "
+                    "Suggests packaged offers are accepted in this local market."
+                )
 
-    if n_dis_to_life >= max(3, int(0.15 * n_emps)):
-        signals.append(
-            f"**Adjacency whitespace (Disability → Life):** {n_dis_to_life:,} employers have disability without Life. "
-            "Candidate pool for Life attach depending on segment fit."
-        )
+            if n_emps >= 25 and frag >= 0.6:
+                signals.append(
+                    f"**Broker fragmentation:** {brokers_n:,} brokers across {n_emps:,} employers (ratio {frag:.2f}). "
+                    "Fragmented structure can favor standardization, packaging, or consolidation plays."
+                )
 
-    if n_bundled >= max(5, int(0.30 * n_emps)):
-        signals.append(
-            f"**Bundling norm present:** {n_bundled:,} employers already bundle Life+Disability. "
-            "Suggests packaged offers are accepted in this local market."
-        )
+            if n_emps >= 25 and brokers_n <= 3:
+                signals.append(
+                    f"**Incumbency risk:** only {brokers_n:,} broker(s) appear in filings. "
+                    "Likely entrenched relationships; prioritize targeted displacement or specialty positioning."
+                )
 
-    if n_emps >= 25 and frag >= 0.6:
-        signals.append(
-            f"**Broker fragmentation:** {brokers_n:,} brokers across {n_emps:,} employers (ratio {frag:.2f}). "
-            "Fragmented structure can favor standardization, packaging, or consolidation plays."
-        )
+            if comm_per_emp > 0:
+                signals.append(
+                    f"**Commission density (proxy):** approx. ${comm_per_emp:,.0f} per employer. "
+                    "Higher values suggest stronger monetization; prioritize account-based motion."
+                )
 
-    if n_emps >= 25 and brokers_n <= 3:
-        signals.append(
-            f"**Incumbency risk:** only {brokers_n:,} broker(s) appear in filings. "
-            "Likely entrenched relationships; prioritize targeted displacement or specialty positioning."
-        )
+            if carriers_n and n_emps >= 20 and carriers_n <= 3:
+                signals.append(
+                    f"**Carrier concentration (proxy):** only {carriers_n:,} carriers appear. "
+                    "May influence pricing leverage and bundling norms; align carrier strategy accordingly."
+                )
 
-    if comm_per_emp > 0:
-        signals.append(
-            f"**Commission density (proxy):** approx. ${comm_per_emp:,.0f} per employer. "
-            "Higher values suggest stronger monetization potential; prioritize account-based motion."
-        )
+            if not signals:
+                signals.append("No strong signals fired under current filters. Try Market benchmark view or remove State filter.")
 
-    if carriers_n and n_emps >= 20 and carriers_n <= 3:
-        signals.append(
-            f"**Carrier concentration (proxy):** only {carriers_n:,} carriers appear. "
-            "May influence pricing leverage and bundling norms; align carrier strategy accordingly."
-        )
+            for s in signals:
+                st.write(f"- {s}")
 
-    if not signals:
-        signals.append("No strong signals fired under current filters. Try Market benchmark view or removing state filter.")
+            st.markdown("### Expandable Employers in this ZIP")
+            show_cols = [c for c in ["Employer", "City", "State", "ZIP"] if c in gz.columns]
+            out = gz[show_cols + ["Expandable_Life_to_Disability", "Expandable_Disability_to_Life", "Bundled"]].copy()
+            out = out.drop_duplicates(subset=["Employer"]).reset_index(drop=True)
 
-    for s in signals:
-        st.write(f"- {s}")
+            def highlight_expand(row):
+                if bool(row.get("Expandable_Life_to_Disability", False)) or bool(row.get("Expandable_Disability_to_Life", False)):
+                    return ["background-color: rgba(0, 200, 0, 0.14)"] * len(row)
+                return [""] * len(row)
 
-    # Styled "Expandable" employer list
-    st.markdown("### Expandable Employers in this ZIP")
-    show_cols = [c for c in ["Employer", "City", "State", "ZIP"] if c in gz.columns]
-    out = gz[show_cols + ["Expandable_Life_to_Disability", "Expandable_Disability_to_Life", "Bundled"]].copy()
-    out = out.drop_duplicates(subset=["Employer"]).reset_index(drop=True)
+            st.dataframe(out.style.apply(highlight_expand, axis=1), use_container_width=True)
 
-    def highlight_expand(row):
-        if row.get("Expandable_Life_to_Disability", False) or row.get("Expandable_Disability_to_Life", False):
-            return ["background-color: rgba(0, 200, 0, 0.14)"] * len(row)
-        return [""] * len(row)
+            if not ez.empty and "Broker" in ez.columns:
+                st.markdown("### Brokers in this ZIP (proxy)")
+                bro = ez.copy()
+                bro["total_commissions"] = pd.to_numeric(bro["total_commissions"], errors="coerce").fillna(0)
+                bro["Is_AON_Composite"] = bro["Broker"].apply(is_aon_composite)
 
-    st.dataframe(out.style.apply(highlight_expand, axis=1), use_container_width=True)
+                bro_agg = (
+                    bro.groupby(["Broker", "Is_AON_Composite"], as_index=False)
+                    .agg(Employers=("Employer", "nunique"), TotalCommissions=("total_commissions", "sum"))
+                    .sort_values(["Is_AON_Composite", "Employers", "TotalCommissions"], ascending=[False, False, False])
+                    .head(50)
+                    .reset_index(drop=True)
+                )
 
-    # Broker list, with AON indicator
-    if not ez.empty and "Broker" in ez.columns:
-        st.markdown("### Brokers in this ZIP (proxy)")
-        bro = ez.copy()
-        bro["total_commissions"] = pd.to_numeric(bro["total_commissions"], errors="coerce").fillna(0)
-        bro["Is_AON_Composite"] = bro["Broker"].apply(is_aon_composite)
+                def highlight_aon(row):
+                    if bool(row.get("Is_AON_Composite", False)):
+                        return ["background-color: rgba(0, 140, 255, 0.12); font-weight: 600;"] * len(row)
+                    return [""] * len(row)
 
-        bro_agg = (
-            bro.groupby(["Broker", "Is_AON_Composite"], as_index=False)
-            .agg(Employers=("Employer", "nunique"), TotalCommissions=("total_commissions", "sum"))
-            .sort_values(["Is_AON_Composite", "Employers", "TotalCommissions"], ascending=[False, False, False])
-            .head(50)
-            .reset_index(drop=True)
-        )
-
-        def highlight_aon(row):
-            if row.get("Is_AON_Composite", False):
-                return ["background-color: rgba(0, 140, 255, 0.12); font-weight: 600;"] * len(row)
-            return [""] * len(row)
-
-        st.dataframe(bro_agg.style.apply(highlight_aon, axis=1), use_container_width=True)
+                st.dataframe(bro_agg.style.apply(highlight_aon, axis=1), use_container_width=True)
 
 
 # =========================
