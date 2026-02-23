@@ -140,13 +140,7 @@ concentration_penalty = st.sidebar.slider(
     help="Higher = penalize brokers/carriers that rely on few accounts."
 )
 
-st.sidebar.divider()
-st.sidebar.subheader("Optional LLM (not required)")
-use_llm = st.sidebar.toggle(
-    "Enable LLM narrative (if configured)",
-    value=False,
-    help="Only works if you set a key in Streamlit Secrets. Otherwise uses deterministic 'AI analyst' narratives."
-)
+
 
 
 # ============================================================
@@ -195,7 +189,12 @@ if cap_value is not None and cap_value > 0:
 median_comm_norm = float(ebc_f["comm_norm"].median()) if len(ebc_f) else 0.0
 median_comm_raw = float(ebc_f["total_commissions"].median()) if len(ebc_f) else 0.0
 
-
+def money(x: float) -> str:
+    try:
+        return f"${float(x):,.0f}"
+    except Exception:
+        return "$0"
+    
 def zscore(s: pd.Series) -> pd.Series:
     s = s.astype(float)
     sd = float(s.std(ddof=0)) if len(s) else 0.0
