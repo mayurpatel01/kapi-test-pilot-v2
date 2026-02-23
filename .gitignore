@@ -1,9 +1,32 @@
-# Raw federal datasets
+# =========================
+# RAW DATA (NEVER COMMIT)
+# =========================
 data/raw/
 
 # Generated data marts
 data/marts/*.parquet
 
-# Python
+# =========================
+# STREAMLIT SECRETS
+# =========================
+.streamlit/secrets.toml
+
+# =========================
+# PYTHON
+# =========================
 .venv/
 __pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# =========================
+# OS / SYSTEM FILES
+# =========================
+.DS_Store
+Thumbs.db
+
+# =========================
+# JUPYTER (if ever used)
+# =========================
+.ipynb_checkpoints/
