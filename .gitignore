@@ -1,0 +1,9 @@
+# Raw federal datasets
+data/raw/
+
+# Generated data marts
+data/marts/*.parquet
+
+# Python
+.venv/
+__pycache__/
