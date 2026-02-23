@@ -207,15 +207,18 @@ if state_filter:
 
 
 # -----------------------------
-# Product columns (defensive mapping)
+# Product columns (fixed)
 # -----------------------------
-# Your gaps mart is described as Employer x Life/STD/LTD flags.
-# Column names vary across builds, so we map robustly.
+life_col = "Life"
+std_col  = "STD"
+ltd_col  = "LTD"
 
-life_col = find_col(gaps, ["Life", "LIFE", "life"])
-std_col  = find_col(gaps, ["STD", "Std", "std", "ShortTermDisability", "SHORT_TERM_DISABILITY"])
-ltd_col  = find_col(gaps, ["LTD", "Ltd", "ltd", "LongTermDisability", "LONG_TERM_DISABILITY"])
-
+def as_flag(series: pd.Series) -> pd.Series:
+    s = series.fillna(0)
+    if s.dtype == "object":
+        s = s.astype(str).str.strip()
+        return s.isin(["1", "TRUE", "True", "true", "Y", "YES", "Yes", "yes"])
+    return s.astype(int).fillna(0) == 1
 # If not found, try contains
 if not life_col:
     life_col = find_col_contains(gaps, "life")
