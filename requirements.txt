@@ -5,3 +5,4 @@ plotly==5.22.0
 duckdb==1.0.0
 setuptools>=68
 wheel
+openai>=1.0.0
