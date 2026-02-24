@@ -602,7 +602,7 @@ with tab_overview:
     with c1:
         st.markdown("### Market share by covered lives (AON vs Competitors)")
         fam_plot = family_agg.copy()
-        fam_plot["Share"] = fam_plot["LivesShare"] * 100.0
+        fam_plot["Share"] = (fam_plot["LivesShare"] * 100.0).round(1)
         fig = px.bar(fam_plot, x="Group", y="Share", text="Share")
         st.plotly_chart(fig, use_container_width=True)
 
