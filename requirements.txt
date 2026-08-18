@@ -6,3 +6,4 @@ duckdb==1.0.0
 setuptools>=68
 wheel
 openai>=1.0.0
+xlsxwriter==3.2.9

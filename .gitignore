@@ -6,6 +6,9 @@ data/raw/
 # Generated data marts
 data/marts/*.parquet
 
+# Generated Excel exports (regenerate with scripts/export_dataset.py)
+exports/
+
 # =========================
 # STREAMLIT SECRETS
 # =========================
