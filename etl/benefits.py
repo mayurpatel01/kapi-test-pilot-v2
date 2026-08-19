@@ -42,9 +42,30 @@ BENEFIT_RULES = [
 ]
 
 # Which bucket each product reports into.
+#
+# AON does not sell medical, dental or vision, so those checkboxes are never
+# read and the free-text classifier drops their atoms -- the dataset is group
+# benefits plus the voluntary line, nothing else.
+#
+# Legal, long term care, identity theft and pet are voluntary products the
+# worksite team quotes, so they count toward voluntary penetration. AD&D is
+# NOT: it is a life rider that ~87% of groups already carry, and counting it
+# pushes apparent penetration to 91% while collapsing the cross-sell list from
+# ~26,000 employers to ~4,400. It stays adjacent and is reported separately.
 CORE_PRODUCTS = ["Life", "STD", "LTD"]
-VOLUNTARY_PRODUCTS = ["Accident", "Critical Illness", "Hospital Indemnity", "Cancer"]
-ADJACENT_PRODUCTS = ["AD&D", "Long Term Care", "Legal", "Identity Theft", "Pet"]
+VOLUNTARY_PRODUCTS = [
+    "Accident", "Critical Illness", "Hospital Indemnity", "Cancer",
+    "Legal", "Long Term Care", "Identity Theft", "Pet",
+]
+ADJACENT_PRODUCTS = ["AD&D"]
+
+# The classic worksite trio, quoted together often enough to track on its own.
+VB_TRIO = ["Accident", "Critical Illness", "Hospital Indemnity"]
+
+
+def column_suffix(product: str) -> str:
+    """Product name -> a safe column suffix, e.g. 'Critical Illness' -> 'CriticalIllness'."""
+    return re.sub(r"[^A-Za-z0-9]", "", product)
 
 PRODUCT_GROUP = (
     {p: "Core" for p in CORE_PRODUCTS}

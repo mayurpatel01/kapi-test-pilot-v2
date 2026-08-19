@@ -28,7 +28,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = REPO_ROOT / "data" / "marts"
 
 sys.path.insert(0, str(REPO_ROOT / "etl"))
-from benefits import VOLUNTARY_PRODUCTS
+from benefits import ALL_PRODUCTS, VB_TRIO, VOLUNTARY_PRODUCTS, column_suffix
 from brokers import (
     TIER1_PATTERNS, TIER_LABEL, assign_tiers, broker_family, is_aon_composite,
     match_rule, norm,
@@ -204,19 +204,22 @@ def build(tier2_pct: float = 0.10, comm_cap: float = 10_000_000.0, lives_cap: fl
     g["DisOnly_NoLife_f"] = g["Dis_f"] & (~g["Life_f"])
     g["MissingAny_f"] = (~g["Life_f"]) | (~g["STD_f"]) | (~g["LTD_f"])
 
-    # ---- Voluntary benefit flags (parsed from Schedule A OTHER free text)
-    for prod in VOLUNTARY_PRODUCTS + ["AD&D", "Long Term Care", "Legal"]:
+    # ---- Voluntary benefit flags (parsed from Schedule A OTHER free text).
+    # Driven off benefits.VOLUNTARY_PRODUCTS so adding a product there flows
+    # through the flags, penetration, targets and carrier sheets automatically.
+    for prod in ALL_PRODUCTS:
         g[f"{prod}_f"] = as_flag(g[prod]) if prod in g.columns else False
 
-    g["AnyVB_f"] = (
-        g["Accident_f"] | g["Critical Illness_f"] | g["Hospital Indemnity_f"] | g["Cancer_f"]
-    )
-    g["VBCount"] = (
-        g["Accident_f"].astype(int) + g["Critical Illness_f"].astype(int)
-        + g["Hospital Indemnity_f"].astype(int) + g["Cancer_f"].astype(int)
-    )
+    g["AnyVB_f"] = False
+    g["VBCount"] = 0
+    for prod in VOLUNTARY_PRODUCTS:
+        g["AnyVB_f"] = g["AnyVB_f"] | g[f"{prod}_f"]
+        g["VBCount"] = g["VBCount"] + g[f"{prod}_f"].astype(int)
+
     # The classic worksite trio sold together.
-    g["VBTrio_f"] = g["Accident_f"] & g["Critical Illness_f"] & g["Hospital Indemnity_f"]
+    g["VBTrio_f"] = True
+    for prod in VB_TRIO:
+        g["VBTrio_f"] = g["VBTrio_f"] & g[f"{prod}_f"]
     # Core-but-no-VB is the cross-sell target: an established group benefits
     # relationship with none of the voluntary line attached.
     g["CoreNoVB_f"] = (g["Life_f"] | g["Dis_f"]) & (~g["AnyVB_f"])
@@ -306,7 +309,7 @@ def build(tier2_pct: float = 0.10, comm_cap: float = 10_000_000.0, lives_cap: fl
     emp["VBMissing"] = emp.apply(vb_missing, axis=1)
     emp["LivesLog"] = emp["CoveredLives"].apply(lambda x: math.log(float(x) + 1.0))
 
-    employers = emp.rename(columns={
+    rename_map = {
         "StateNorm": "State",
         "Life_f": "Has_Life",
         "STD_f": "Has_STD",
@@ -315,17 +318,18 @@ def build(tier2_pct: float = 0.10, comm_cap: float = 10_000_000.0, lives_cap: fl
         "LifeOnly_NoDis_f": "LifeOnly_NoDisability",
         "DisOnly_NoLife_f": "DisabilityOnly_NoLife",
         "MissingAny_f": "MissingAnyProduct",
-        "Accident_f": "Has_Accident",
-        "Critical Illness_f": "Has_CriticalIllness",
-        "Hospital Indemnity_f": "Has_HospitalIndemnity",
-        "Cancer_f": "Has_Cancer",
         "AD&D_f": "Has_ADandD",
-        "Long Term Care_f": "Has_LongTermCare",
-        "Legal_f": "Has_Legal",
         "AnyVB_f": "Has_AnyVoluntary",
         "VBTrio_f": "Has_VoluntaryTrio",
         "CoreNoVB_f": "CoreButNoVoluntary",
-    })[[
+    }
+    vb_has_cols = []
+    for prod in VOLUNTARY_PRODUCTS:
+        col = f"Has_{column_suffix(prod)}"
+        rename_map[f"{prod}_f"] = col
+        vb_has_cols.append(col)
+
+    employers = emp.rename(columns=rename_map)[[
         "Employer", "State", "City", "ZIP", "EIN",
         "PrimaryBroker", "PrimaryBrokerNorm", "BrokerFamily", "BrokerTier",
         "BrokerCount", "PrimaryBrokerCommissions", "TotalCommissions",
@@ -333,10 +337,10 @@ def build(tier2_pct: float = 0.10, comm_cap: float = 10_000_000.0, lives_cap: fl
         "Has_Life", "Has_STD", "Has_LTD",
         "ProductsHeld", "ProductsMissing",
         "Has_Life_And_Disability", "LifeOnly_NoDisability", "DisabilityOnly_NoLife", "MissingAnyProduct",
-        "Has_Accident", "Has_CriticalIllness", "Has_HospitalIndemnity", "Has_Cancer",
+    ] + vb_has_cols + [
         "VBCount", "VBHeld", "VBMissing",
         "Has_AnyVoluntary", "Has_VoluntaryTrio", "CoreButNoVoluntary",
-        "Has_ADandD", "Has_LongTermCare", "Has_Legal",
+        "Has_ADandD",
     ]].sort_values("CoveredLives", ascending=False)
     employers["BrokerTier"] = employers["BrokerTier"].map(TIER_LABEL).fillna(employers["BrokerTier"])
 
@@ -400,12 +404,10 @@ def build(tier2_pct: float = 0.10, comm_cap: float = 10_000_000.0, lives_cap: fl
     # ---- Voluntary benefits: penetration by product
     vb_rows = []
     n_emp = len(employers)
-    for prod, col in [("Accident", "Has_Accident"), ("Critical Illness", "Has_CriticalIllness"),
-                      ("Hospital Indemnity", "Has_HospitalIndemnity"), ("Cancer", "Has_Cancer"),
-                      ("--- ANY of the four ---", "Has_AnyVoluntary"),
-                      ("--- ALL of Acc+CI+Hosp ---", "Has_VoluntaryTrio"),
-                      ("AD&D (not a VB - shown for contrast)", "Has_ADandD"),
-                      ("Long Term Care", "Has_LongTermCare"), ("Legal", "Has_Legal")]:
+    rollups = [("--- ANY voluntary product ---", "Has_AnyVoluntary"),
+               (f"--- ALL of {' + '.join(VB_TRIO)} ---", "Has_VoluntaryTrio"),
+               ("AD&D (life rider, NOT counted as voluntary)", "Has_ADandD")]
+    for prod, col in [(p, f"Has_{column_suffix(p)}") for p in VOLUNTARY_PRODUCTS] + rollups:
         sel = employers[employers[col]]
         vb_rows.append({
             "Product": prod,
@@ -419,18 +421,18 @@ def build(tier2_pct: float = 0.10, comm_cap: float = 10_000_000.0, lives_cap: fl
 
     # ---- Voluntary benefits: attach-rate gap by broker tier
     # This is the sheet that answers "who is leaving VB on the table".
+    tier_aggs = {f"{column_suffix(p)}Rate": (f"Has_{column_suffix(p)}", "mean")
+                 for p in VOLUNTARY_PRODUCTS}
     vb_by_tier = (
         employers.groupby("BrokerTier", as_index=False)
                  .agg(Employers=("Employer", "nunique"), CoveredLives=("CoveredLives", "sum"),
-                      AccidentRate=("Has_Accident", "mean"),
-                      CriticalIllnessRate=("Has_CriticalIllness", "mean"),
-                      HospitalIndemnityRate=("Has_HospitalIndemnity", "mean"),
                       AnyVBRate=("Has_AnyVoluntary", "mean"),
-                      CoreNoVBRate=("CoreButNoVoluntary", "mean"))
+                      CoreNoVBRate=("CoreButNoVoluntary", "mean"),
+                      **tier_aggs)
                  .sort_values("CoveredLives", ascending=False)
     )
-    for c in ["AccidentRate", "CriticalIllnessRate", "HospitalIndemnityRate", "AnyVBRate", "CoreNoVBRate"]:
-        vb_by_tier[c.replace("Rate", "%")] = vb_by_tier.pop(c) * 100.0
+    for c in [c for c in vb_by_tier.columns if c.endswith("Rate")]:
+        vb_by_tier[c[:-4] + "%"] = vb_by_tier.pop(c) * 100.0
 
     # ---- Voluntary benefits: the cross-sell target list
     # Employers with an established core relationship and zero voluntary attached.
@@ -451,8 +453,8 @@ def build(tier2_pct: float = 0.10, comm_cap: float = 10_000_000.0, lives_cap: fl
                       "ProductsHeld", "VBHeld"]
     vb_targets = {}
     has_core = employers["Has_Life"] | employers["Has_STD"] | employers["Has_LTD"]
-    for prod, col in [("Accident", "Has_Accident"), ("Critical Illness", "Has_CriticalIllness"),
-                      ("Hospital Indemnity", "Has_HospitalIndemnity"), ("Cancer", "Has_Cancer")]:
+    for prod in VOLUNTARY_PRODUCTS:
+        col = f"Has_{column_suffix(prod)}"
         tgt = employers[has_core & ~employers[col]].copy()
         # Already buys voluntary, just not this one -- the warmest subset.
         tgt["AlreadyBuysVoluntary"] = tgt["Has_AnyVoluntary"]
@@ -463,8 +465,8 @@ def build(tier2_pct: float = 0.10, comm_cap: float = 10_000_000.0, lives_cap: fl
 
     # ---- Per-product opportunity summary: sizes each product's gap in one view.
     opp_rows = []
-    for prod, col in [("Accident", "Has_Accident"), ("Critical Illness", "Has_CriticalIllness"),
-                      ("Hospital Indemnity", "Has_HospitalIndemnity"), ("Cancer", "Has_Cancer")]:
+    for prod in VOLUNTARY_PRODUCTS:
+        col = f"Has_{column_suffix(prod)}"
         tgt = vb_targets[prod]
         warm = tgt[tgt["AlreadyBuysVoluntary"]]
         opp_rows.append({
@@ -479,6 +481,18 @@ def build(tier2_pct: float = 0.10, comm_cap: float = 10_000_000.0, lives_cap: fl
             "TargetsOnCompetitorBook": int((~tgt["BrokerFamily"].eq("AON")).sum()),
         })
     vb_opportunity = pd.DataFrame(opp_rows).sort_values("TargetLives", ascending=False)
+
+    # A dedicated target sheet is only worth a tab where enough employers hold the
+    # product for the gap to mean anything. Identity theft and pet are counted in
+    # every rollup but are too thin to justify a ~50k-row target list, so they are
+    # skipped here -- and said out loud rather than silently dropped.
+    TARGET_SHEET_MIN_HOLDERS = 500
+    target_products = [p for p in VOLUNTARY_PRODUCTS
+                       if int(employers[f"Has_{column_suffix(p)}"].sum()) >= TARGET_SHEET_MIN_HOLDERS]
+    skipped = [p for p in VOLUNTARY_PRODUCTS if p not in target_products]
+    if skipped:
+        log(f"no target sheet for {', '.join(skipped)} "
+            f"(<{TARGET_SHEET_MIN_HOLDERS} employers hold them; still counted in all rollups)")
 
     # ---- Voluntary benefits: carrier league table
     vb_carriers = (
@@ -513,10 +527,7 @@ def build(tier2_pct: float = 0.10, comm_cap: float = 10_000_000.0, lives_cap: fl
         "vb_by_tier": vb_by_tier,
         "vb_whitespace": vb_whitespace,
         "vb_carriers": vb_carriers,
-        "vb_target_accident": vb_targets["Accident"],
-        "vb_target_ci": vb_targets["Critical Illness"],
-        "vb_target_hospital": vb_targets["Hospital Indemnity"],
-        "vb_target_cancer": vb_targets["Cancer"],
+        **{f"vb_target_{column_suffix(p).lower()}": vb_targets[p] for p in target_products},
         "broker_summary": broker_agg[[
             "PrimaryBroker", "PrimaryBrokerNorm", "BrokerFamily", "TierLabel", "Employers", "CoveredLives",
             "LivesShare%", "EmployerShare%", "TotalCommissions",
@@ -533,7 +544,7 @@ def build(tier2_pct: float = 0.10, comm_cap: float = 10_000_000.0, lives_cap: fl
         "data_quality_flags": flags,
         "detail_broker": detail_broker,
         "detail_carrier": detail_carrier,
-    }, dq
+    }, {**dq, "target_products": target_products}
 
 
 # =========================================================
@@ -612,12 +623,15 @@ def write_readme(writer, counts: dict, dq: dict, tier2_pct: float, with_detail: 
         ("VB_Opportunity_By_Product", f"{counts['vb_opportunity']:,} rows. Sizes the sell-in gap for each voluntary "
                                       "product: who holds it today, how many employers are addressable, and how many "
                                       "of those already buy some other voluntary product (the warm subset)."),
-        ("Target_Accident", f"{counts['vb_target_accident']:,} rows. Named employers to sell ACCIDENT to - core "
-                            "coverage in place, no accident product. Sorted warm targets first, then by size."),
-        ("Target_CriticalIllness", f"{counts['vb_target_ci']:,} rows. Named employers to sell CRITICAL ILLNESS to."),
-        ("Target_HospitalIndemnity", f"{counts['vb_target_hospital']:,} rows. Named employers to sell HOSPITAL "
-                                     "INDEMNITY to."),
-        ("Target_Cancer", f"{counts['vb_target_cancer']:,} rows. Named employers to sell CANCER cover to."),
+    ]
+    for prod in dq["target_products"]:
+        n = counts[f"vb_target_{column_suffix(prod).lower()}"]
+        sheets.append((
+            f"Target_{column_suffix(prod)}",
+            f"{n:,} rows. Named employers to sell {prod.upper()} to - core coverage in place, no "
+            f"{prod.lower()} product. Sorted warm targets (already buy some voluntary) first, then by size.",
+        ))
+    sheets += [
         ("VB_By_Broker_Tier", f"{counts['vb_by_tier']:,} rows. Voluntary attach rates by broker tier - shows which "
                               "tiers are leaving the voluntary line unsold."),
         ("VB_Crosssell_Targets", f"{counts['vb_whitespace']:,} rows. Employers holding core products (life and/or "
@@ -692,8 +706,13 @@ def write_readme(writer, counts: dict, dq: dict, tier2_pct: float, with_detail: 
     caveats = [
         "Employers are keyed on the sponsor name as filed - separate legal entities of the same parent appear as "
         "separate rows. No parent-company roll-up has been applied.",
-        "Core products in scope are Life, STD and LTD, plus the voluntary products parsed from the OTHER free text; "
-        "medical/dental/vision are excluded.",
+        "AON does not sell medical, dental or vision, so those lines are excluded from the pipeline entirely - "
+        "their Schedule A checkboxes are never read and the free-text parser drops their labels. In scope are the "
+        "core group lines (Life, STD, LTD) and the voluntary products: accident, critical illness, hospital "
+        "indemnity, cancer, legal, long term care, identity theft and pet.",
+        "AD&D is NOT counted as a voluntary product. It is a life rider that ~87% of groups already carry; counting "
+        "it would put voluntary penetration at ~91% and shrink the cross-sell list from ~26,000 employers to ~4,400, "
+        "hiding the real opportunity. It is reported separately on VB_Penetration for contrast.",
         "Voluntary products are identified from free text, so coverage depends on how each filer described the plan. "
         "A filer who wrote nothing in the OTHER box will look like they have no voluntary benefit even if they do - "
         "treat the voluntary counts as a floor, not an exact census.",
@@ -744,12 +763,10 @@ def export(out_path: Path, tier2_pct: float, with_detail: bool, comm_cap: float,
                       "WarmTargetLives", "TargetsOnAONBook", "TargetsOnCompetitorBook"),
             pct_cols=("Penetration%",),
         )
-        for sheet, key in [("Target_Accident", "vb_target_accident"),
-                           ("Target_CriticalIllness", "vb_target_ci"),
-                           ("Target_HospitalIndemnity", "vb_target_hospital"),
-                           ("Target_Cancer", "vb_target_cancer")]:
+        for prod in dq["target_products"]:
             write_sheet(
-                writer, d[key], sheet,
+                writer, d[f"vb_target_{column_suffix(prod).lower()}"],
+                f"Target_{column_suffix(prod)}",
                 money_cols=("TotalCommissions",), int_cols=("CoveredLives",),
             )
         write_sheet(

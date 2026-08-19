@@ -28,7 +28,7 @@ import streamlit as st
 import plotly.express as px
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "etl"))
-from benefits import ALL_PRODUCTS, CORE_PRODUCTS, VOLUNTARY_PRODUCTS  # noqa: E402
+from benefits import ALL_PRODUCTS, CORE_PRODUCTS, VB_TRIO, VOLUNTARY_PRODUCTS  # noqa: E402
 from brokers import (  # noqa: E402
     TIER1_PATTERNS, assign_tiers, broker_family, is_aon_composite, match_any, norm,
 )
@@ -271,8 +271,14 @@ VB_PRODUCTS = list(VOLUNTARY_PRODUCTS)
 for prod in ALL_PRODUCTS:
     g[f"{prod}_f"] = as_flag(g[prod]) if prod in g.columns else False
 
-g["AnyVB_f"] = g["Accident_f"] | g["Critical Illness_f"] | g["Hospital Indemnity_f"] | g["Cancer_f"]
-g["VBTrio_f"] = g["Accident_f"] & g["Critical Illness_f"] & g["Hospital Indemnity_f"]
+g["AnyVB_f"] = False
+for _p in VOLUNTARY_PRODUCTS:
+    g["AnyVB_f"] = g["AnyVB_f"] | g[f"{_p}_f"]
+
+g["VBTrio_f"] = True
+for _p in VB_TRIO:
+    g["VBTrio_f"] = g["VBTrio_f"] & g[f"{_p}_f"]
+
 g["CoreNoVB_f"] = (g["Life_f"] | g["Dis_f"]) & (~g["AnyVB_f"])
 
 # Geo merge (State/City)
@@ -743,19 +749,20 @@ with tab_whitespace:
     # Voluntary benefits
     # ---------------------------------------------------------
     st.markdown("---")
-    st.subheader("Voluntary Benefits (Accident / Critical Illness / Hospital Indemnity / Cancer)")
+    st.subheader("Voluntary Benefits")
     st.caption(
         "Voluntary products have no Schedule A checkbox - they are parsed out of the OTHER free-text field, "
-        "so these counts are a floor rather than an exact census. AD&D is shown separately because it is a life "
-        "rider, not a worksite product; counting it as 'accident' roughly doubles apparent penetration."
+        "so these counts are a floor rather than an exact census. AD&D is shown for contrast but does NOT count "
+        "as voluntary: it is a life rider ~87% of groups already carry, and including it would put penetration "
+        "near 91% and hide the real opportunity."
     )
 
     vb_rows = []
     n_emp = tmp["Employer"].nunique()
-    for label, col in [("Accident", "Accident_f"), ("Critical Illness", "Critical Illness_f"),
-                       ("Hospital Indemnity", "Hospital Indemnity_f"), ("Cancer", "Cancer_f"),
-                       ("Any of the four", "AnyVB_f"), ("Acc + CI + Hosp (all three)", "VBTrio_f"),
-                       ("AD&D (not a VB)", "AD&D_f")]:
+    rollups = [("Any voluntary product", "AnyVB_f"),
+               (" + ".join(VB_TRIO) + " (all)", "VBTrio_f"),
+               ("AD&D (not counted as voluntary)", "AD&D_f")]
+    for label, col in [(p, f"{p}_f") for p in VOLUNTARY_PRODUCTS] + rollups:
         sel = tmp[tmp[col]]
         vb_rows.append({
             "Product": label,
@@ -768,21 +775,20 @@ with tab_whitespace:
     c1, c2 = st.columns([2, 3])
     with c1:
         st.markdown("#### Penetration")
-        figv = px.bar(vb_pen[vb_pen["Product"] != "AD&D (not a VB)"], x="Product", y="Penetration")
+        figv = px.bar(vb_pen[vb_pen["Product"].isin(VOLUNTARY_PRODUCTS)], x="Product", y="Penetration")
         figv.update_layout(yaxis_tickformat=".0%", xaxis_title=None)
         st.plotly_chart(figv, use_container_width=True)
     with c2:
         st.markdown("#### Voluntary attach rate by broker tier")
+        # Chart the trio plus the any-VB rollup; the thin products would be flat lines.
+        tier_aggs = {p.replace(" ", ""): (f"{p}_f", "mean") for p in VB_TRIO}
         vb_tier = (
             tmp.groupby("BrokerTier", as_index=False)
-               .agg(Accident=("Accident_f", "mean"),
-                    CriticalIllness=("Critical Illness_f", "mean"),
-                    HospitalIndemnity=("Hospital Indemnity_f", "mean"),
-                    AnyVB=("AnyVB_f", "mean"))
+               .agg(AnyVB=("AnyVB_f", "mean"), **tier_aggs)
         )
         figt = px.bar(
             vb_tier.melt(id_vars=["BrokerTier"],
-                         value_vars=["Accident", "CriticalIllness", "HospitalIndemnity", "AnyVB"]),
+                         value_vars=[p.replace(" ", "") for p in VB_TRIO] + ["AnyVB"]),
             x="BrokerTier", y="value", color="variable", barmode="group",
         )
         figt.update_layout(yaxis_tickformat=".0%", xaxis_title=None, yaxis_title=None)
