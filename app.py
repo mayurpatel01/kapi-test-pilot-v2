@@ -28,6 +28,7 @@ import streamlit as st
 import plotly.express as px
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "etl"))
+from benefits import ALL_PRODUCTS, CORE_PRODUCTS, VOLUNTARY_PRODUCTS  # noqa: E402
 from brokers import (  # noqa: E402
     TIER1_PATTERNS, assign_tiers, broker_family, is_aon_composite, match_any, norm,
 )
@@ -266,8 +267,8 @@ g["MissingAny_f"] = (~g["Life_f"]) | (~g["STD_f"]) | (~g["LTD_f"])
 # Voluntary benefit flags. These come from the Schedule A OTHER free text rather
 # than a checkbox - see etl/benefits.py. AD&D is kept separate from Accident on
 # purpose; folding it in roughly doubles apparent VB penetration.
-VB_PRODUCTS = ["Accident", "Critical Illness", "Hospital Indemnity", "Cancer"]
-for prod in VB_PRODUCTS + ["AD&D"]:
+VB_PRODUCTS = list(VOLUNTARY_PRODUCTS)
+for prod in ALL_PRODUCTS:
     g[f"{prod}_f"] = as_flag(g[prod]) if prod in g.columns else False
 
 g["AnyVB_f"] = g["Accident_f"] | g["Critical Illness_f"] | g["Hospital Indemnity_f"] | g["Cancer_f"]
@@ -332,6 +333,36 @@ with st.sidebar:
     st.caption("Tip: Start with defaults, then adjust to reflect sales strategy (Tier2/Tier3 emphasis vs Tier1).")
 
     st.divider()
+    st.markdown("## Products")
+    product_mode = st.radio(
+        "Product filter",
+        ["No product filter",
+         "HOLDS selected products",
+         "MISSING selected products (sell-in targets)"],
+        index=0,
+        help="Filters every tab, not just this one. 'Missing' is the sell-in view: "
+             "employers who do not hold the selected product(s).",
+    )
+    product_filter = st.multiselect(
+        "Products",
+        options=ALL_PRODUCTS,
+        default=[],
+        help="Voluntary products (accident, critical illness, hospital indemnity, cancer) are parsed "
+             "from the Schedule A OTHER free text, not a checkbox. AD&D is listed separately because "
+             "it is a life rider, not a worksite product.",
+    )
+    product_match_all = st.toggle(
+        "Match ALL selected (instead of ANY)", value=False,
+        help="ANY: holds/misses at least one of the selected products. "
+             "ALL: holds/misses every one of them.",
+    )
+    require_core = st.toggle(
+        "Sell-in targets must hold a core product", value=True,
+        help="Restricts 'missing' results to employers with an existing life or disability "
+             "relationship - i.e. a real cross-sell conversation, not a cold open.",
+    )
+
+    st.divider()
     st.markdown("## Geography")
     available_states = sorted([s for s in emp["StateNorm"].dropna().unique().tolist() if s in VALID_STATES])
     state_filter = st.multiselect("State filter", options=available_states, default=[])
@@ -345,6 +376,39 @@ if employer_search:
 
 if state_filter:
     emp_view = emp_view[emp_view["StateNorm"].isin(state_filter)].copy()
+
+# Product filter. Applied to the base view so every downstream tab - market share,
+# whitespace, opportunity scoring, target lists - reflects the selection.
+product_filter_note = ""
+if product_filter and product_mode != "No product filter":
+    flags = [emp_view[f"{p}_f"] for p in product_filter]
+
+    held_any = flags[0].copy()
+    held_all = flags[0].copy()
+    for s in flags[1:]:
+        held_any = held_any | s
+        held_all = held_all & s
+
+    joiner = " AND " if product_match_all else " or "
+    names = joiner.join(product_filter)
+
+    if product_mode.startswith("HOLDS"):
+        # ALL -> holds every selected product; ANY -> holds at least one.
+        mask = held_all if product_match_all else held_any
+        product_filter_note = f"Holds {names}"
+    else:
+        # De Morgan: missing EVERY selected product is NOT(holds any);
+        # missing AT LEAST ONE is NOT(holds all).
+        mask = (~held_any) if product_match_all else (~held_all)
+        product_filter_note = f"Missing {names}"
+
+    emp_view = emp_view[mask].copy()
+
+    if product_mode.startswith("MISSING") and require_core:
+        emp_view = emp_view[
+            emp_view["Life_f"] | emp_view["STD_f"] | emp_view["LTD_f"]
+        ].copy()
+        product_filter_note += " (with core coverage)"
 
 
 # =========================
@@ -512,6 +576,15 @@ state_score = state_score.sort_values("TotalOpportunity", ascending=False)
 # =========================
 # Header KPIs
 # =========================
+# Make an active product filter impossible to miss - every number below it is
+# scoped to the selection, not to the whole market.
+if product_filter_note:
+    st.info(
+        f"**Product filter active — {product_filter_note}.** "
+        f"{int(emp_view['Employer'].nunique()):,} of {int(emp['Employer'].nunique()):,} employers in view. "
+        "Every tab below reflects this filter."
+    )
+
 k1, k2, k3, k4 = st.columns(4)
 k1.metric("Employers in view", f"{int(emp_view['Employer'].nunique()):,}")
 k2.metric("Total covered lives", f"{int(emp_view['CoveredLives'].sum()):,}")
