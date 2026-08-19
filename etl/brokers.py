@@ -54,6 +54,23 @@ _AON_UNIT = re.compile(
     r"CORPORATION|GROUP|SECURITIES|SOLUTIONS|SERVICES)\b"
 )
 
+# Rule D -- AON-owned brands that carry no "Aon" in the name at all, so none of
+# the rules above can reach them. Only the subset most filers write WITHOUT the
+# "an Aon company" suffix: Custom Benefit Programs (which also files as DBA
+# Univers) and Cammack Health. Left as competitors before this rule: 42 distinct
+# spellings, 626 employers, $129.6M of commissions.
+#
+# Deliberately precise. "CUSTOM BENEFIT CONSULTANTS" and "CUSTOM BENEFITS GROUP"
+# are different firms, and UNIVERS must not reach UNIVERSAL INSURANCE ADVISORS or
+# NORTHWESTERN UNIVERSITY, so the Univers rule requires the WORKPLACE token.
+_AON_BRANDS = re.compile(
+    r"^CUSTOM BENEFITS? PROGRAMS?\b"      # Custom Benefit Programs, Inc.
+    r"|^CUSTOM BNFT PROGRAMS?\b"          # abbreviated filings
+    r"|^CUSTON BENEFITS? PROGRAMS?\b"     # filer typo
+    r"|\bUNIVERS WORKPLACE\b"             # Univers Workplace Benefits / Solutions
+    r"|\bCAMMACK HEALTH\b"                # Cammack Health LLC, an Aon company
+)
+
 TIER1_PATTERNS = {
     "MARSH": [r"\bMARSH\b", r"\bMARSH\s+MCLENNAN\b", r"\bMMC\b"],
     "WTW": [r"\bWILLIS\b", r"\bTOWERS\b", r"\bWTW\b", r"\bWILLIS\s+TOWERS\s+WATSON\b"],
@@ -71,7 +88,8 @@ TIER_LABEL = {
 
 def is_aon_composite(broker_name: str) -> bool:
     n = norm(broker_name)
-    return bool(_AON_PREFIX.search(n) or _AON_SUBSIDIARY.search(n) or _AON_UNIT.search(n))
+    return bool(_AON_PREFIX.search(n) or _AON_SUBSIDIARY.search(n)
+                or _AON_UNIT.search(n) or _AON_BRANDS.search(n))
 
 
 def aon_match_rule(broker_name: str) -> str:
@@ -83,6 +101,8 @@ def aon_match_rule(broker_name: str) -> str:
         return "AON composite (declared AON subsidiary)"
     if _AON_UNIT.search(n):
         return "AON composite (named AON operating unit)"
+    if _AON_BRANDS.search(n):
+        return "AON composite (AON-owned brand)"
     return ""
 
 

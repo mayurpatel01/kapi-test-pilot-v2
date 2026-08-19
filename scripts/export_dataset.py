@@ -462,6 +462,113 @@ def build(tier2_pct: float = 0.10, comm_cap: float = 10_000_000.0, lives_cap: fl
     )
     whitespace["Employers%"] = whitespace["Employers"] / whitespace["Employers"].sum() * 100.0
 
+    # ---- Employer x product detail: ONE ROW PER PRODUCT PER EMPLOYER.
+    # The "where do we stand, line by line" view. Money columns are named for
+    # exactly what they are, because Form 5500 does not report all of them at
+    # product grain:
+    #   CoveredLives          - real, per product (MAX across carriers, as elsewhere)
+    #   PremiumOnContracts    - real, but OVERLAPPING: a life+STD+LTD contract
+    #                           reports one premium and it appears on all three rows
+    #   SoleProductPremium    - real and unambiguous: contracts covering only this product
+    #   EmployerCommissions   - real, but EMPLOYER-level, repeated on every row
+    #   EstCommissionForProduct - ESTIMATE: employer commissions split by the
+    #                           product's share of that employer's premium
+    prod_lives = (
+        epc.groupby(["Employer", "Product", "ProductGroup"], as_index=False)
+           .agg(CoveredLives=("Covered_Lives", "max"),
+                Carriers=("Carrier", "nunique"),
+                Contracts=("ContractRowID", "nunique"))
+    )
+    prod_premium = (
+        epc.drop_duplicates(["Employer", "Product", "ContractRowID"])
+           .groupby(["Employer", "Product"], as_index=False)
+           .agg(PremiumOnContracts=("Premium", "sum"))
+    )
+    sole_ids = set(contracts.loc[contracts["ProductCount"] == 1, "ContractRowID"])
+    prod_sole = (
+        epc[epc["ContractRowID"].isin(sole_ids)]
+           .drop_duplicates(["Employer", "Product", "ContractRowID"])
+           .groupby(["Employer", "Product"], as_index=False)
+           .agg(SoleProductPremium=("Premium", "sum"))
+    )
+    prod_top_carrier = (
+        epc.groupby(["Employer", "Product", "Carrier"], as_index=False)
+           .agg(_l=("Covered_Lives", "max"))
+           .sort_values(["Employer", "Product", "_l"], ascending=[True, True, False])
+           .drop_duplicates(["Employer", "Product"])[["Employer", "Product", "Carrier"]]
+           .rename(columns={"Carrier": "TopCarrier"})
+    )
+
+    emp_cols = ["Employer", "EIN", "State", "City", "PrimaryBroker", "BrokerFamily",
+                "BrokerTier", "TotalCommissions", "TotalPremium", "CoveredLives"]
+    product_detail = (
+        prod_lives
+        .merge(prod_premium, on=["Employer", "Product"], how="left")
+        .merge(prod_sole, on=["Employer", "Product"], how="left")
+        .merge(prod_top_carrier, on=["Employer", "Product"], how="left")
+        .merge(employers[emp_cols].rename(columns={
+            "TotalCommissions": "EmployerCommissions",
+            "TotalPremium": "EmployerPremium",
+            "CoveredLives": "EmployerCoveredLives",
+        }), on="Employer", how="left")
+    )
+    product_detail["PremiumOnContracts"] = product_detail["PremiumOnContracts"].fillna(0)
+    product_detail["SoleProductPremium"] = product_detail["SoleProductPremium"].fillna(0)
+    product_detail["EmployerCommissions"] = product_detail["EmployerCommissions"].fillna(0)
+
+    # Pro-rata commission estimate. Shares sum to 1 per employer by construction,
+    # so the estimates reconstitute the employer total even though the underlying
+    # premium figures overlap.
+    share_base = product_detail.groupby("Employer")["PremiumOnContracts"].transform("sum")
+    product_detail["ProductPremiumShare%"] = (
+        product_detail["PremiumOnContracts"] / share_base.replace(0, pd.NA) * 100.0
+    )
+    product_detail["EstCommissionForProduct"] = (
+        product_detail["EmployerCommissions"]
+        * product_detail["PremiumOnContracts"] / share_base.replace(0, pd.NA)
+    )
+    # An employer who reported commissions but no premium anywhere has nothing to
+    # split the commission across, so the estimate is blank rather than zero.
+    # Flagged instead of hidden: summing EstCommissionForProduct will fall short
+    # of total commissions by exactly this much.
+    product_detail["CommissionAllocatable"] = share_base > 0
+    _unalloc = product_detail.loc[
+        (~product_detail["CommissionAllocatable"]) & (product_detail["EmployerCommissions"] > 0)
+    ].drop_duplicates("Employer")
+    if len(_unalloc):
+        log(f"commission estimate unavailable for {len(_unalloc):,} employers "
+            f"(${_unalloc['EmployerCommissions'].sum():,.0f}) - they report commissions but no premium")
+
+    # EIN is an identifier: keep it text so Excel neither strips a leading zero
+    # nor renders it in scientific notation.
+    product_detail["EIN"] = (
+        product_detail["EIN"].astype(str)
+        .str.replace(r"\.0$", "", regex=True)
+        .replace({"nan": "", "<NA>": "", "None": ""})
+    )
+
+    # The filter the whole page exists for.
+    product_detail["AON_Is_Broker"] = product_detail["BrokerFamily"].eq("AON")
+    product_detail["BrokerStatus"] = product_detail["AON_Is_Broker"].map(
+        {True: "AON is broker of record", False: "NOT AON - opportunity"}
+    )
+    product_detail["PremiumPerLife"] = (
+        product_detail["PremiumOnContracts"] / product_detail["CoveredLives"].replace(0, pd.NA)
+    )
+
+    product_detail = product_detail[[
+        "Employer", "EIN", "State", "City",
+        "Product", "ProductGroup",
+        "CoveredLives", "PremiumOnContracts", "PremiumPerLife", "SoleProductPremium",
+        "ProductPremiumShare%", "EstCommissionForProduct", "CommissionAllocatable",
+        "BrokerStatus", "AON_Is_Broker", "PrimaryBroker", "BrokerFamily", "BrokerTier",
+        "EmployerCommissions", "EmployerPremium", "EmployerCoveredLives",
+        "TopCarrier", "Carriers", "Contracts",
+    ]].sort_values(["PremiumOnContracts", "Employer", "Product"], ascending=[False, True, True])
+
+    log(f"product detail: {len(product_detail):,} employer-product rows "
+        f"({int((~product_detail['AON_Is_Broker']).sum()):,} not on the AON book)")
+
     # ---- Premium by product.
     # A contract covering several benefits reports ONE premium, so these figures
     # OVERLAP and must not be summed down the column. ContractsIncluding /
@@ -616,6 +723,7 @@ def build(tier2_pct: float = 0.10, comm_cap: float = 10_000_000.0, lives_cap: fl
 
     return {
         "employers": employers,
+        "product_detail": product_detail,
         "premium_by_product": premium_by_product,
         "vb_penetration": vb_penetration,
         "vb_opportunity": vb_opportunity,
@@ -708,6 +816,11 @@ def write_readme(writer, counts: dict, dq: dict, tier2_pct: float, with_detail: 
         ("Employers", f"{counts['employers']:,} rows. One row per employer - the master cleaned table. "
                       "Product coverage, covered lives, premium, premium per life, commissions, commission as a "
                       "percent of premium, primary broker + matched family/tier, geography."),
+        ("Employer_Product_Detail", f"{counts['product_detail']:,} rows. ONE ROW PER PRODUCT PER EMPLOYER - the "
+                                    "line-by-line view. Lives, premium, estimated commission, EIN, incumbent broker "
+                                    "and a BrokerStatus column that splits 'AON is broker of record' from "
+                                    "'NOT AON - opportunity'. Filter BrokerStatus to see the whitespace. "
+                                    "Read the money-column notes in Caveats before quoting these figures."),
         ("Premium_By_Product", f"{counts['premium_by_product']:,} rows. Premium and contract counts per product. "
                                "NOTE: PremiumOnThoseContracts figures overlap and must not be summed - "
                                "SoleProductPremium is the unambiguous single-product figure."),
@@ -833,6 +946,16 @@ def write_readme(writer, counts: dict, dq: dict, tier2_pct: float, with_detail: 
         "same reason premium cannot be split by product - see the Premium_By_Product sheet, where "
         "'PremiumOnThoseContracts' figures OVERLAP and must not be added down the column. 'SoleProductPremium' is "
         "the only premium unambiguously attributable to one product.",
+        "ON THE Employer_Product_Detail SHEET, the money columns are not interchangeable. CoveredLives is real per "
+        "product. PremiumOnContracts is real but OVERLAPS across products on a shared contract, so it must not be "
+        "summed down the column for one employer. SoleProductPremium is the unambiguous single-product figure. "
+        "EmployerCommissions is the employer's TOTAL, repeated on every one of that employer's rows - summing it "
+        "multiplies by the product count. EstCommissionForProduct is an ESTIMATE that splits employer commissions by "
+        "each product's share of premium; the shares sum to 1 per employer, so the estimates do add back to the "
+        "employer total. Use it for relative sizing, not as a reported figure. Where an employer reported "
+        "commissions but no premium at all there is nothing to split across, so the estimate is BLANK and "
+        "CommissionAllocatable is FALSE - 267 employers and $15.0M of commissions sit in that bucket, which is "
+        "exactly how far a sum of EstCommissionForProduct will fall short of total commissions.",
         "Premium is a coalesce of two Schedule A fields: WLFR_PREMIUM_RCVD_AMT (the experience-rated section, ~7% "
         "populated) falling back to WLFR_TOT_CHARGES_PAID_AMT ('total charges paid for this contract', ~78% "
         "populated). Together they cover ~84% of Schedule A rows. Employers with no premium figure are not "
@@ -862,6 +985,13 @@ def export(out_path: Path, tier2_pct: float, with_detail: bool, comm_cap: float,
             money_cols=("TotalCommissions", "PrimaryBrokerCommissions", "TotalPremium", "PremiumPerLife"),
             int_cols=("CoveredLives", "BrokerCount", "CarrierCount", "ContractCount"),
             pct_cols=("CommissionPctOfPremium",),
+        )
+        write_sheet(
+            writer, d["product_detail"], "Employer_Product_Detail",
+            money_cols=("PremiumOnContracts", "PremiumPerLife", "SoleProductPremium",
+                        "EstCommissionForProduct", "EmployerCommissions", "EmployerPremium"),
+            int_cols=("CoveredLives", "EmployerCoveredLives", "Carriers", "Contracts"),
+            pct_cols=("ProductPremiumShare%",),
         )
         write_sheet(
             writer, d["premium_by_product"], "Premium_By_Product",

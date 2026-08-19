@@ -220,7 +220,40 @@ if missing:
 # Normalize numeric fields
 # =========================
 epc["Covered_Lives"] = to_numeric(epc["Covered_Lives"]).fillna(0)
+epc["Premium"] = to_numeric(epc["Premium"]).fillna(0) if "Premium" in epc.columns else 0.0
 ebc["total_commissions"] = to_numeric(ebc["total_commissions"]).fillna(0)
+if len(contracts) and "Premium" in contracts.columns:
+    contracts["Premium"] = to_numeric(contracts["Premium"]).fillna(0)
+
+
+# =========================
+# Data-quality guard
+# =========================
+# Form 5500 is self-reported and a few filings carry keying errors large enough
+# to swamp every total: one row reports $563 TRILLION in commissions, and two
+# small employers report 5-6M covered lives. The Excel export has always capped
+# these; the dashboard did not, so every commission figure here silently carried
+# the $563T row. Same thresholds as scripts/export_dataset.py so the two agree.
+COMM_CAP = 10_000_000.0
+LIVES_CAP = 1_500_000.0
+PREMIUM_CAP = 500_000_000.0
+
+_comm_raw = float(ebc["total_commissions"].sum())
+_n_comm = int((ebc["total_commissions"] > COMM_CAP).sum())
+_n_lives = int((epc["Covered_Lives"] > LIVES_CAP).sum())
+_n_prem = int((contracts["Premium"] > PREMIUM_CAP).sum()) if len(contracts) else 0
+
+ebc = ebc[ebc["total_commissions"] <= COMM_CAP].copy()
+epc = epc[epc["Covered_Lives"] <= LIVES_CAP].copy()
+if len(contracts):
+    contracts = contracts[contracts["Premium"] <= PREMIUM_CAP].copy()
+
+DQ_NOTE = (
+    f"Excluded {_n_comm} commission row(s) over ${COMM_CAP:,.0f}, {_n_lives} row(s) over "
+    f"{LIVES_CAP:,.0f} covered lives, and {_n_prem} contract(s) over ${PREMIUM_CAP:,.0f} premium "
+    f"as filer keying errors. Commissions as filed totalled ${_comm_raw:,.0f} because one row "
+    f"reports $563 trillion; cleaned they total ${ebc['total_commissions'].sum():,.0f}."
+)
 
 # Normalize products a bit (defensive)
 epc["ProductNorm"] = epc["Product"].apply(norm)
@@ -308,11 +341,17 @@ g["CoreHeld"] = [
 
 # Geo merge (State/City)
 geo_use = geo.copy()
-for col in ["State", "City"]:
+for col in ["State", "City", "EIN"]:
     if col not in geo_use.columns:
         geo_use[col] = np.nan
 geo_use["StateNorm"] = geo_use["State"].apply(normalize_state) if "State" in geo_use.columns else np.nan
 geo_use.loc[~geo_use["StateNorm"].isin(list(VALID_STATES)), "StateNorm"] = np.nan
+# EIN is an identifier, not a quantity - keep it text so 07-1234567 style values
+# do not lose their leading zero or pick up thousands separators.
+geo_use["EIN"] = (
+    geo_use["EIN"].astype(str).str.replace(r"\.0$", "", regex=True)
+    .replace({"nan": "", "<NA>": "", "None": ""})
+)
 
 # Premium per employer, summed over DISTINCT contracts (see the load block above).
 if len(contracts) and "Premium" in contracts.columns:
@@ -329,7 +368,7 @@ emp = (
      .merge(emp_comm, on="Employer", how="left")
      .merge(emp_premium, on="Employer", how="left")
      .merge(primary_broker, on="Employer", how="left")
-     .merge(geo_use[["Employer", "StateNorm", "City"]], on="Employer", how="left")
+     .merge(geo_use[["Employer", "StateNorm", "City", "EIN"]], on="Employer", how="left")
 )
 
 emp["CoveredLives"] = to_numeric(emp["CoveredLives"]).fillna(0)
@@ -638,6 +677,9 @@ if product_filter_note:
         "Every tab below reflects this filter."
     )
 
+with st.expander("Data quality: which rows are excluded and why"):
+    st.write(DQ_NOTE)
+
 k1, k2, k3, k4, k5, k6 = st.columns(6)
 k1.metric("Employers in view", f"{int(emp_view['Employer'].nunique()):,}")
 k2.metric("Total covered lives", f"{int(emp_view['CoveredLives'].sum()):,}")
@@ -663,8 +705,10 @@ st.divider()
 # =========================
 # Tabs
 # =========================
-tab_overview, tab_comp, tab_whitespace, tab_scoring, tab_diag, tab_report, tab_ai, tab_raw = st.tabs(
+(tab_product, tab_overview, tab_comp, tab_whitespace, tab_scoring,
+ tab_diag, tab_report, tab_ai, tab_raw) = st.tabs(
     [
+        "Product Detail",
         "Market Overview",
         "Competitive Share",
         "Product Whitespace",
@@ -675,6 +719,152 @@ tab_overview, tab_comp, tab_whitespace, tab_scoring, tab_diag, tab_report, tab_a
         "Raw Tables",
     ]
 )
+
+
+# =========================
+# Product Detail - one row per employer per product
+# =========================
+with tab_product:
+    st.subheader("Every product, every employer - one row each")
+    st.caption(
+        "Lives are real per product. Premium is real but OVERLAPS where one contract covers several "
+        "products, so do not sum it down the column for a single employer. Commission is an estimate: "
+        "Form 5500 reports commissions at employer/broker grain with no product dimension, so the "
+        "employer total is split by each product's share of premium."
+    )
+
+    @st.cache_data(show_spinner="Building product detail...")
+    def build_product_detail(_epc: pd.DataFrame, emp_slim: pd.DataFrame) -> pd.DataFrame:
+        base = (
+            _epc.groupby(["Employer", "Product", "ProductGroup"], as_index=False)
+                .agg(CoveredLives=("Covered_Lives", "max"),
+                     Carriers=("Carrier", "nunique"),
+                     Contracts=("ContractRowID", "nunique"))
+        )
+        prem = (
+            _epc.drop_duplicates(["Employer", "Product", "ContractRowID"])
+                .groupby(["Employer", "Product"], as_index=False)
+                .agg(Premium=("Premium", "sum"))
+        )
+        topc = (
+            _epc.groupby(["Employer", "Product", "Carrier"], as_index=False)
+                .agg(_l=("Covered_Lives", "max"))
+                .sort_values(["Employer", "Product", "_l"], ascending=[True, True, False])
+                .drop_duplicates(["Employer", "Product"])[["Employer", "Product", "Carrier"]]
+                .rename(columns={"Carrier": "TopCarrier"})
+        )
+        out = (base.merge(prem, on=["Employer", "Product"], how="left")
+                   .merge(topc, on=["Employer", "Product"], how="left")
+                   .merge(emp_slim, on="Employer", how="left"))
+        out["Premium"] = out["Premium"].fillna(0)
+        out["TotalCommissions"] = out["TotalCommissions"].fillna(0)
+
+        share = out.groupby("Employer")["Premium"].transform("sum")
+        out["EstCommission"] = out["TotalCommissions"] * out["Premium"] / share.replace(0, np.nan)
+        # No premium anywhere means nothing to split the commission across, so the
+        # estimate is blank rather than a misleading zero.
+        out["CommissionAllocatable"] = share > 0
+        out["PremiumPerLife"] = out["Premium"] / out["CoveredLives"].replace(0, np.nan)
+        out["AON_Is_Broker"] = out["BrokerFamily"].eq("AON")
+        out["BrokerStatus"] = np.where(out["AON_Is_Broker"], "AON is broker of record",
+                                       "NOT AON - opportunity")
+        out["EIN"] = (out["EIN"].astype(str).str.replace(r"\.0$", "", regex=True)
+                        .replace({"nan": "", "<NA>": "", "None": ""}))
+        return out
+
+    _emp_slim = emp_view[["Employer", "EIN", "StateNorm", "City", "PrimaryBroker",
+                          "BrokerFamily", "BrokerTier", "TotalCommissions"]].drop_duplicates("Employer")
+    pdet = build_product_detail(epc, _emp_slim)
+    pdet = pdet[pdet["Employer"].isin(set(emp_view["Employer"]))]
+
+    f1, f2, f3 = st.columns([1.2, 1.4, 1.4])
+    with f1:
+        broker_view = st.radio(
+            "Broker of record",
+            ["Everyone", "NOT AON (opportunity)", "AON only"],
+            index=0,
+            help="AON includes its owned brands - Custom Benefit Programs, Univers Workplace, "
+                 "Cammack Health - not just names starting with 'Aon'.",
+        )
+    with f2:
+        prod_pick = st.multiselect("Products", options=ALL_PRODUCTS, default=[],
+                                   help="Leave empty for all products.")
+    with f3:
+        group_pick = st.multiselect("Product group", options=["Core", "Voluntary", "Adjacent"],
+                                    default=[])
+
+    view = pdet
+    if broker_view.startswith("NOT AON"):
+        view = view[~view["AON_Is_Broker"]]
+    elif broker_view.startswith("AON only"):
+        view = view[view["AON_Is_Broker"]]
+    if prod_pick:
+        view = view[view["Product"].isin(prod_pick)]
+    if group_pick:
+        view = view[view["ProductGroup"].isin(group_pick)]
+
+    view = view.sort_values("Premium", ascending=False)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Rows in view", f"{len(view):,}")
+    c2.metric("Employers", f"{view['Employer'].nunique():,}")
+    _p = float(view["Premium"].sum())
+    c3.metric("Premium (overlapping)", f"${_p/1e9:.2f}B" if _p >= 1e9 else f"${_p/1e6:,.0f}M")
+    _ec = float(view["EstCommission"].fillna(0).sum())
+    c4.metric("Est. commission", f"${_ec/1e6:,.1f}M")
+
+    _stuck = view[~view["CommissionAllocatable"]]
+    _stuck_comm = _stuck.drop_duplicates("Employer")["TotalCommissions"].sum()
+    if _stuck_comm > 0:
+        st.caption(
+            f"⚠ {_stuck['Employer'].nunique():,} employers in this view (${_stuck_comm/1e6:,.1f}M of "
+            "commissions) reported no premium, so their commission cannot be split by product. "
+            "The estimate above is short by that amount."
+        )
+
+    st.markdown("#### By product")
+    roll = (view.groupby(["ProductGroup", "Product"], as_index=False)
+                .agg(Employers=("Employer", "nunique"), Lives=("CoveredLives", "sum"),
+                     Premium=("Premium", "sum"), EstCommission=("EstCommission", "sum"))
+                .sort_values("Premium", ascending=False))
+    st.dataframe(
+        roll, use_container_width=True, hide_index=True,
+        column_config={
+            "Lives": st.column_config.NumberColumn(format="%,d"),
+            "Premium": st.column_config.NumberColumn(format="$%,.0f"),
+            "EstCommission": st.column_config.NumberColumn("Est. commission", format="$%,.0f"),
+        },
+    )
+
+    ROW_CAP = 5000
+    st.markdown(f"#### Detail rows")
+    if len(view) > ROW_CAP:
+        st.caption(f"Showing the top {ROW_CAP:,} of {len(view):,} rows by premium. "
+                   "Narrow the filters, or use the download for the full set.")
+    st.dataframe(
+        view.head(ROW_CAP)[[
+            "Employer", "EIN", "StateNorm", "Product", "ProductGroup", "CoveredLives",
+            "Premium", "PremiumPerLife", "EstCommission", "BrokerStatus", "PrimaryBroker",
+            "BrokerFamily", "BrokerTier", "TopCarrier", "TotalCommissions",
+        ]].reset_index(drop=True),
+        use_container_width=True, hide_index=True,
+        column_config={
+            "StateNorm": st.column_config.TextColumn("State"),
+            "CoveredLives": st.column_config.NumberColumn("Lives", format="%,d"),
+            "Premium": st.column_config.NumberColumn(format="$%,.0f"),
+            "PremiumPerLife": st.column_config.NumberColumn("Prem/life", format="$%,.0f"),
+            "EstCommission": st.column_config.NumberColumn("Est. comm (product)", format="$%,.0f"),
+            "TotalCommissions": st.column_config.NumberColumn("Employer comm (total)", format="$%,.0f"),
+        },
+    )
+
+    st.download_button(
+        "Download this view as CSV",
+        data=view.to_csv(index=False).encode("utf-8"),
+        file_name="product_detail.csv",
+        mime="text/csv",
+        help="Downloads every filtered row, not just the ones displayed above.",
+    )
 
 
 # =========================
