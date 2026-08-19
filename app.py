@@ -186,6 +186,14 @@ with st.spinner("Loading data marts..."):
     ebc = ensure_str(load_parquet("employer_broker_commissions.parquet"))
     gaps = ensure_str(load_parquet("employer_product_matrix.parquet"))
 
+    # Contract-level mart. Premium MUST be summed from here rather than from epc:
+    # a contract covering life + STD + LTD appears three times in the product view
+    # and carries one premium, so summing there inflates it ~2.5x.
+    try:
+        contracts = ensure_str(load_parquet("employer_contract.parquet"))
+    except FileNotFoundError:
+        contracts = pd.DataFrame(columns=["ContractRowID", "Employer", "Carrier", "Premium"])
+
     try:
         geo = ensure_str(load_parquet("employer_geo.parquet"))
     except FileNotFoundError:
@@ -306,17 +314,39 @@ for col in ["State", "City"]:
 geo_use["StateNorm"] = geo_use["State"].apply(normalize_state) if "State" in geo_use.columns else np.nan
 geo_use.loc[~geo_use["StateNorm"].isin(list(VALID_STATES)), "StateNorm"] = np.nan
 
+# Premium per employer, summed over DISTINCT contracts (see the load block above).
+if len(contracts) and "Premium" in contracts.columns:
+    contracts["Premium"] = to_numeric(contracts["Premium"]).fillna(0)
+    emp_premium = (
+        contracts.groupby("Employer", as_index=False)
+                 .agg(TotalPremium=("Premium", "sum"), ContractCount=("ContractRowID", "nunique"))
+    )
+else:
+    emp_premium = pd.DataFrame(columns=["Employer", "TotalPremium", "ContractCount"])
+
 emp = (
     g.merge(emp_lives, on="Employer", how="left")
      .merge(emp_comm, on="Employer", how="left")
+     .merge(emp_premium, on="Employer", how="left")
      .merge(primary_broker, on="Employer", how="left")
      .merge(geo_use[["Employer", "StateNorm", "City"]], on="Employer", how="left")
 )
 
 emp["CoveredLives"] = to_numeric(emp["CoveredLives"]).fillna(0)
 emp["TotalCommissions"] = to_numeric(emp["TotalCommissions"]).fillna(0)
+emp["TotalPremium"] = to_numeric(emp["TotalPremium"]).fillna(0)
+emp["ContractCount"] = to_numeric(emp["ContractCount"]).fillna(0).astype(int)
 emp["PrimaryBroker"] = emp["PrimaryBroker"].fillna("UNKNOWN")
 emp["BrokerFamily"] = emp["PrimaryBroker"].apply(broker_family)
+
+# Left as NaN, not 0, where the denominator is missing: a filer who left the
+# premium box empty is unknown, not free.
+emp["PremiumPerLife"] = np.where(
+    emp["CoveredLives"] > 0, emp["TotalPremium"] / emp["CoveredLives"].replace(0, np.nan), np.nan
+)
+emp["CommissionPctOfPremium"] = np.where(
+    emp["TotalPremium"] > 0, emp["TotalCommissions"] / emp["TotalPremium"].replace(0, np.nan) * 100.0, np.nan
+)
 
 
 # =========================
@@ -608,13 +638,24 @@ if product_filter_note:
         "Every tab below reflects this filter."
     )
 
-k1, k2, k3, k4 = st.columns(4)
+k1, k2, k3, k4, k5, k6 = st.columns(6)
 k1.metric("Employers in view", f"{int(emp_view['Employer'].nunique()):,}")
 k2.metric("Total covered lives", f"{int(emp_view['CoveredLives'].sum()):,}")
+
+_prem = float(emp_view["TotalPremium"].sum())
+k3.metric("Total premium", f"${_prem/1e9:.2f}B" if _prem >= 1e9 else f"${_prem/1e6:,.0f}M")
+_comm = float(emp_view["TotalCommissions"].sum())
+k4.metric(
+    "Total commissions",
+    f"${_comm/1e9:.2f}B" if _comm >= 1e9 else f"${_comm/1e6:,.0f}M",
+    delta=f"{_comm/_prem*100:.1f}% of premium" if _prem > 0 else None,
+    delta_color="off",
+)
+
 aon_lives = float(family_agg.loc[family_agg["Group"] == "AON", "CoveredLives"].sum())
 comp_lives = float(family_agg.loc[family_agg["Group"] == "Competitors", "CoveredLives"].sum())
-k3.metric("AON lives share (view)", f"{(aon_lives / (aon_lives + comp_lives) * 100.0):.1f}%" if (aon_lives + comp_lives) else "—")
-k4.metric("Targets eligible", f"{int(emp_view['IsTargetEligible'].sum()):,}")
+k5.metric("AON lives share (view)", f"{(aon_lives / (aon_lives + comp_lives) * 100.0):.1f}%" if (aon_lives + comp_lives) else "—")
+k6.metric("Targets eligible", f"{int(emp_view['IsTargetEligible'].sum()):,}")
 
 st.divider()
 
@@ -817,12 +858,25 @@ with tab_whitespace:
     st.caption("Employers holding life and/or disability with no voluntary product attached.")
     vb_targets = (
         tmp[tmp["CoreNoVB_f"]][
-            ["Employer", "StateNorm", "CoveredLives", "TotalCommissions", "CoreHeld",
-             "PrimaryBroker", "BrokerFamily", "BrokerTier"]
-        ].sort_values("CoveredLives", ascending=False)
+            ["Employer", "StateNorm", "CoveredLives", "TotalPremium", "PremiumPerLife",
+             "TotalCommissions", "CoreHeld", "PrimaryBroker", "BrokerFamily", "BrokerTier"]
+        ].sort_values("TotalPremium", ascending=False)
     )
-    st.metric("Employers with core products but zero voluntary", f"{len(vb_targets):,}")
-    st.dataframe(vb_targets.head(300).reset_index(drop=True), use_container_width=True)
+    m1, m2 = st.columns(2)
+    m1.metric("Employers with core products but zero voluntary", f"{len(vb_targets):,}")
+    m2.metric("Premium already in place with those employers",
+              f"${vb_targets['TotalPremium'].sum()/1e9:.2f}B")
+    st.caption("Premium in place is what they already spend on life/disability - the size of the "
+               "relationship, not the voluntary revenue on offer.")
+    st.dataframe(
+        vb_targets.head(300).reset_index(drop=True), use_container_width=True,
+        column_config={
+            "TotalPremium": st.column_config.NumberColumn("Premium", format="$%,.0f"),
+            "PremiumPerLife": st.column_config.NumberColumn("Prem/life", format="$%,.0f"),
+            "TotalCommissions": st.column_config.NumberColumn("Commissions", format="$%,.0f"),
+            "CoveredLives": st.column_config.NumberColumn("Lives", format="%,d"),
+        },
+    )
 
     st.markdown("---")
     st.markdown("### Whitespace distribution by state")
@@ -893,9 +947,20 @@ with tab_scoring:
 
     t["Why"] = t.apply(why_row, axis=1)
 
-    show_cols = ["Employer", "StateNorm", "City", "CoveredLives", "PrimaryBroker", "BrokerFamily", "BrokerTier",
-                 "TotalCommissions", "CoreHeld", "VBHeld", "VBMissing", "OpportunityScore", "Why"]
-    st.dataframe(t[show_cols].reset_index(drop=True), use_container_width=True)
+    show_cols = ["Employer", "StateNorm", "City", "CoveredLives", "TotalPremium", "PremiumPerLife",
+                 "TotalCommissions", "CommissionPctOfPremium", "PrimaryBroker", "BrokerFamily", "BrokerTier",
+                 "CoreHeld", "VBHeld", "VBMissing", "OpportunityScore", "Why"]
+    st.dataframe(
+        t[show_cols].reset_index(drop=True),
+        use_container_width=True,
+        column_config={
+            "TotalPremium": st.column_config.NumberColumn("Premium", format="$%,.0f"),
+            "PremiumPerLife": st.column_config.NumberColumn("Prem/life", format="$%,.0f"),
+            "TotalCommissions": st.column_config.NumberColumn("Commissions", format="$%,.0f"),
+            "CommissionPctOfPremium": st.column_config.NumberColumn("Comm % of prem", format="%.1f%%"),
+            "CoveredLives": st.column_config.NumberColumn("Lives", format="%,d"),
+        },
+    )
 
     st.markdown("### State opportunity ranking")
     st.dataframe(
@@ -1126,7 +1191,9 @@ with tab_raw:
                "AD&D is shown but is not counted as voluntary.")
     st.dataframe(
         emp_view[
-            ["Employer", "StateNorm", "City", "CoveredLives", "TotalCommissions", "PrimaryBroker", "BrokerFamily", "BrokerTier",
+            ["Employer", "StateNorm", "City", "CoveredLives", "TotalPremium", "PremiumPerLife",
+             "TotalCommissions", "CommissionPctOfPremium", "ContractCount",
+             "PrimaryBroker", "BrokerFamily", "BrokerTier",
              "Life_f", "STD_f", "LTD_f", "MissingAny_f"]
             + [f"{p}_f" for p in VOLUNTARY_PRODUCTS]
             + ["AD&D_f", "VBCount", "VBHeld", "AnyVB_f", "CoreNoVB_f", "OpportunityScore"]

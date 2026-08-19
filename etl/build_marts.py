@@ -9,6 +9,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from benefits import ALL_PRODUCTS, PRODUCT_GROUP, explode_other_text
 
 OTHER_TEXT_COL = "WLFR_TYPE_BNFT_OTH_TEXT"
+PREMIUM_COL = "WLFR_PREMIUM_RCVD_AMT"
+CHARGES_COL = "WLFR_TOT_CHARGES_PAID_AMT"
+RET_COMM_COL = "WLFR_RET_COMMISSIONS_AMT"
 
 
 def log(msg: str):
@@ -126,14 +129,50 @@ def build_marts(zip_a: Path, zip_b: Path, zip_c: Path, out_dir: Path):
     df_b["Carrier"] = df_b[carrier_name_col].astype(str) if carrier_name_col and carrier_name_col in df_b.columns else "UNKNOWN"
     df_b["Covered_Lives"] = safe_numeric(df_b[covered_lives_col]) if covered_lives_col and covered_lives_col in df_b.columns else 0.0
 
+    # ---- Premium
+    # Schedule A reports the money two ways and a contract fills in one or the
+    # other. WLFR_PREMIUM_RCVD_AMT is the experience-rated section and is only
+    # ~7% populated; WLFR_TOT_CHARGES_PAID_AMT ("total charges paid for this
+    # contract") is ~78% populated and is the premium equivalent for everyone
+    # else. Coalescing prefers the explicit premium and falls back to charges,
+    # which covers ~84% of Schedule A rows.
+    #
+    # Left UNCAPPED here on purpose: the marts stay faithful to what was filed
+    # and the export applies caps, so every excluded row keeps an audit trail on
+    # Data_Quality_Flags rather than vanishing at build time.
+    prem_rcvd = safe_numeric(df_b[PREMIUM_COL]) if PREMIUM_COL in df_b.columns else 0.0
+    charges = safe_numeric(df_b[CHARGES_COL]) if CHARGES_COL in df_b.columns else 0.0
+    df_b["Premium"] = prem_rcvd.where(prem_rcvd > 0, charges) if PREMIUM_COL in df_b.columns else charges
+    df_b["PremiumSource"] = "none"
+    df_b.loc[charges > 0, "PremiumSource"] = "total charges paid"
+    if PREMIUM_COL in df_b.columns:
+        df_b.loc[prem_rcvd > 0, "PremiumSource"] = "premium received (experience-rated)"
+    df_b["RetainedCommission"] = (
+        safe_numeric(df_b[RET_COMM_COL]) if RET_COMM_COL in df_b.columns else 0.0
+    )
+
+    log(f"premium populated on {int((df_b['Premium'] > 0).sum()):,} of {len(df_b):,} Schedule A rows "
+        f"({(df_b['Premium'] > 0).mean() * 100:.1f}%)")
+
     df_b["IS_LIFE"] = coerce_indicator(df_b[ind_life]) if ind_life in df_b.columns else 0
     df_b["IS_STD"] = coerce_indicator(df_b[ind_std]) if ind_std in df_b.columns else 0
     df_b["IS_LTD"] = coerce_indicator(df_b[ind_ltd]) if ind_ltd in df_b.columns else 0
 
+    # One Schedule A row can list several benefits, so after the explosion below
+    # a single contract appears once per product. ContractRowID identifies the
+    # source row so money can be summed over DISTINCT contracts instead of over
+    # exploded product rows -- without it, premium double-counts exactly the way
+    # covered lives would.
+    df_b = df_b.reset_index(drop=True)
+    df_b["ContractRowID"] = df_b.index.astype("int64")
+
+    CARRY = ["ACK_ID", "ContractRowID", "Carrier", "Covered_Lives", "Premium",
+             "PremiumSource", "RetainedCommission"]
+
     # Expand into long rows by product -- checkbox products first
     parts = []
     for prod, flag in [("Life", "IS_LIFE"), ("STD", "IS_STD"), ("LTD", "IS_LTD")]:
-        tmp = df_b[df_b[flag] == 1][["ACK_ID", "Carrier", "Covered_Lives"]].copy()
+        tmp = df_b[df_b[flag] == 1][CARRY].copy()
         tmp["Product"] = prod
         parts.append(tmp)
 
@@ -143,7 +182,7 @@ def build_marts(zip_a: Path, zip_b: Path, zip_c: Path, out_dir: Path):
         vb = explode_other_text(
             df_b,
             text_col=OTHER_TEXT_COL,
-            keep_cols=["ACK_ID", "Carrier", "Covered_Lives"],
+            keep_cols=CARRY,
         )
         log(f"Parsed {len(vb):,} product rows from OTHER free text "
             f"({vb['ACK_ID'].nunique():,} filings, {vb['Product'].nunique()} distinct products)")
@@ -167,6 +206,32 @@ def build_marts(zip_a: Path, zip_b: Path, zip_c: Path, out_dir: Path):
     out_epc = out_dir / "employer_product_carrier.parquet"
     log(f"Writing {out_epc}")
     employer_product_carrier.to_parquet(out_epc, index=False)
+
+    # -----------------------------
+    # Contract-level mart: ONE row per Schedule A contract, pre-explosion.
+    # Employer premium must be summed from here, never from the product-exploded
+    # table, or a contract covering three benefits is counted three times.
+    # -----------------------------
+    contracts = (
+        employer_product_carrier
+        .sort_values("Product")
+        .groupby("ContractRowID", as_index=False)
+        .agg(
+            ACK_ID=("ACK_ID", "first"),
+            Employer=("Employer", "first"),
+            Carrier=("Carrier", "first"),
+            Covered_Lives=("Covered_Lives", "first"),
+            Premium=("Premium", "first"),
+            PremiumSource=("PremiumSource", "first"),
+            RetainedCommission=("RetainedCommission", "first"),
+            Products=("Product", lambda s: " + ".join(sorted(set(s)))),
+            ProductCount=("Product", "nunique"),
+        )
+    )
+    out_contracts = out_dir / "employer_contract.parquet"
+    log(f"Writing {out_contracts} ({len(contracts):,} contracts, "
+        f"${contracts['Premium'].sum():,.0f} premium as filed)")
+    contracts.to_parquet(out_contracts, index=False)
 
     # -----------------------------
     # Employer product matrix (gap table) from B only
@@ -245,6 +310,7 @@ def build_marts(zip_a: Path, zip_b: Path, zip_c: Path, out_dir: Path):
         .agg(
             unique_employers=("Employer", "nunique"),
             covered_lives=("Covered_Lives", "sum"),
+            premium=("Premium", "sum"),
         )
         .sort_values(["ProductGroup", "Product", "covered_lives"], ascending=[True, True, False])
     )
