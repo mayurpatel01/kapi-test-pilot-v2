@@ -3,8 +3,14 @@
 # =========================
 data/raw/
 
-# Generated data marts
-data/marts/*.parquet
+# Generated data marts.
+# These ARE committed: Streamlit Cloud builds from the repo and never runs the
+# ETL, so an untracked mart simply does not exist in the deployed app. This rule
+# used to ignore them all, which silently kept employer_geo (state analysis) and
+# employer_contract (premium) out of production while the older marts stayed
+# tracked from before the rule existed. Ignore stray parquet elsewhere instead.
+*.parquet
+!data/marts/*.parquet
 
 # Generated Excel exports (regenerate with scripts/export_dataset.py)
 exports/
