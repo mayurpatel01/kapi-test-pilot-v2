@@ -281,6 +281,23 @@ for _p in VB_TRIO:
 
 g["CoreNoVB_f"] = (g["Life_f"] | g["Dis_f"]) & (~g["AnyVB_f"])
 
+# Readable product columns so every table can show what a group actually holds,
+# not just a row of booleans.
+_vb_flags = g[[f"{p}_f" for p in VOLUNTARY_PRODUCTS]].to_numpy()
+g["VBHeld"] = [
+    " + ".join([p for p, f in zip(VOLUNTARY_PRODUCTS, row) if f]) or "(none)"
+    for row in _vb_flags
+]
+g["VBMissing"] = [
+    " + ".join([p for p, f in zip(VOLUNTARY_PRODUCTS, row) if not f]) or "(complete)"
+    for row in _vb_flags
+]
+g["VBCount"] = _vb_flags.sum(axis=1)
+g["CoreHeld"] = [
+    " + ".join([p for p, f in zip(CORE_PRODUCTS, row) if f]) or "(none)"
+    for row in g[[f"{p}_f" for p in CORE_PRODUCTS]].to_numpy()
+]
+
 # Geo merge (State/City)
 geo_use = geo.copy()
 for col in ["State", "City"]:
@@ -800,7 +817,8 @@ with tab_whitespace:
     st.caption("Employers holding life and/or disability with no voluntary product attached.")
     vb_targets = (
         tmp[tmp["CoreNoVB_f"]][
-            ["Employer", "StateNorm", "CoveredLives", "TotalCommissions", "PrimaryBroker", "BrokerFamily", "BrokerTier"]
+            ["Employer", "StateNorm", "CoveredLives", "TotalCommissions", "CoreHeld",
+             "PrimaryBroker", "BrokerFamily", "BrokerTier"]
         ].sort_values("CoveredLives", ascending=False)
     )
     st.metric("Employers with core products but zero voluntary", f"{len(vb_targets):,}")
@@ -852,12 +870,17 @@ with tab_scoring:
     def why_row(r: pd.Series) -> str:
         reasons = []
         if r.get("MissingAny_f", False):
-            missing = []
-            if not bool(r.get("Life_f", False)): missing.append("Life")
-            if not bool(r.get("STD_f", False)): missing.append("STD")
-            if not bool(r.get("LTD_f", False)): missing.append("LTD")
+            missing = [p for p in CORE_PRODUCTS if not bool(r.get(f"{p}_f", False))]
             if missing:
-                reasons.append(f"Missing: {', '.join(missing)}")
+                reasons.append(f"Missing core: {', '.join(missing)}")
+        # Voluntary gap is the whole point of the pilot, so it is called out
+        # explicitly rather than left for the reader to infer from the flags.
+        if not bool(r.get("AnyVB_f", False)):
+            reasons.append("No voluntary products")
+        elif not bool(r.get("VBTrio_f", False)):
+            gap = [p for p in VB_TRIO if not bool(r.get(f"{p}_f", False))]
+            if gap:
+                reasons.append(f"Voluntary gap: {', '.join(gap)}")
         if float(r.get("CoveredLives", 0)) > 0:
             reasons.append(f"Lives: {int(r['CoveredLives']):,}")
         if str(r.get("BrokerTier","")):
@@ -871,7 +894,7 @@ with tab_scoring:
     t["Why"] = t.apply(why_row, axis=1)
 
     show_cols = ["Employer", "StateNorm", "City", "CoveredLives", "PrimaryBroker", "BrokerFamily", "BrokerTier",
-                 "TotalCommissions", "OpportunityScore", "Why"]
+                 "TotalCommissions", "CoreHeld", "VBHeld", "VBMissing", "OpportunityScore", "Why"]
     st.dataframe(t[show_cols].reset_index(drop=True), use_container_width=True)
 
     st.markdown("### State opportunity ranking")
@@ -1099,10 +1122,14 @@ with tab_raw:
     st.subheader("Raw Tables (for validation)")
 
     st.markdown("#### Employer table (modeled)")
+    st.caption("One boolean column per product. Voluntary products come from the Schedule A OTHER free text; "
+               "AD&D is shown but is not counted as voluntary.")
     st.dataframe(
         emp_view[
             ["Employer", "StateNorm", "City", "CoveredLives", "TotalCommissions", "PrimaryBroker", "BrokerFamily", "BrokerTier",
-             "Life_f", "STD_f", "LTD_f", "MissingAny_f", "OpportunityScore"]
+             "Life_f", "STD_f", "LTD_f", "MissingAny_f"]
+            + [f"{p}_f" for p in VOLUNTARY_PRODUCTS]
+            + ["AD&D_f", "VBCount", "VBHeld", "AnyVB_f", "CoreNoVB_f", "OpportunityScore"]
         ].head(500).reset_index(drop=True),
         use_container_width=True,
     )
