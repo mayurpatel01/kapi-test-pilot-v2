@@ -5,7 +5,8 @@
 # Data marts expected in data/marts:
 # - employer_product_carrier.parquet: ['ACK_ID','Carrier','Covered_Lives','Product','Employer_ID','Employer']
 # - employer_broker_commissions.parquet: ['ACK_ID','Broker','total_commissions','Employer_ID','Employer']
-# - employer_product_matrix.parquet: ['Employer','Life','STD','LTD']
+# - employer_product_matrix.parquet: ['Employer','Life','STD','LTD','Accident','Critical Illness',
+#     'Hospital Indemnity','Cancer','AD&D','Long Term Care','Legal','Identity Theft','Pet']
 # - employer_geo.parquet (optional, downloaded via EMPLOYER_GEO_URL): ['Employer','State','ZIP','City','EIN'] (we use State/City)
 #
 # Key assumptions:
@@ -15,6 +16,7 @@
 
 import os
 import re
+import sys
 import math
 import urllib.request
 from pathlib import Path
@@ -24,6 +26,11 @@ import pandas as pd
 import numpy as np
 import streamlit as st
 import plotly.express as px
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "etl"))
+from brokers import (  # noqa: E402
+    TIER1_PATTERNS, assign_tiers, broker_family, is_aon_composite, match_any, norm,
+)
 
 
 # =========================
@@ -125,13 +132,7 @@ def load_parquet(filename: str) -> pd.DataFrame:
     return pd.read_parquet(path)
 
 
-def norm(s: str) -> str:
-    if s is None:
-        return ""
-    s = str(s).upper().strip()
-    s = re.sub(r"[^\w\s]", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+# norm() is imported from etl/brokers.py -- see the import block at the top.
 
 
 def to_numeric(s: pd.Series) -> pd.Series:
@@ -219,74 +220,11 @@ epc["ProductNorm"] = epc["Product"].apply(norm)
 # =========================
 # AON Composite + Competitor Tiers
 # =========================
-AON_ROOTS = [
-    "AON CORPORATION",
-    "AON RISK SERVICES",
-    "AON HEWITT",
-    "AON CONSULTING",
-    "AON SOLUTIONS",
-]
-
-def is_aon_composite(broker_name: str) -> bool:
-    n = norm(broker_name)
-    for root in AON_ROOTS:
-        r = norm(root)
-        # Must start with root to avoid DATAONLINE false positives
-        if re.match(rf"^{re.escape(r)}(\s+.*)?$", n):
-            return True
-    return False
-
-# Tier 1 majors: keep simple name matching (robust enough for strategy view)
-TIER1_PATTERNS = {
-    "MARSH": [r"\bMARSH\b", r"\bMARSH\s+MCLENNAN\b", r"\bMMC\b"],
-    "WTW": [r"\bWILLIS\b", r"\bTOWERS\b", r"\bWTW\b", r"\bWILLIS\s+TOWERS\s+WATSON\b"],
-    "GALLAGHER": [r"\bGALLAGHER\b", r"\bARTHUR\s+J\s+GALLAGHER\b"],
-    "BROWN & BROWN": [r"\bBROWN\b.*\bBROWN\b", r"\bBROWN\s*&\s*BROWN\b"],
-}
-
-def match_any(patterns, text):
-    for p in patterns:
-        if re.search(p, text):
-            return True
-    return False
-
-def broker_family(broker_name: str) -> str:
-    n = norm(broker_name)
-    if not n:
-        return "UNKNOWN"
-
-    if is_aon_composite(n):
-        return "AON"
-
-    # Tier1 named
-    for fam, pats in TIER1_PATTERNS.items():
-        if match_any(pats, n):
-            return fam
-
-    return "OTHER"
-
-def assign_tiers(broker_agg: pd.DataFrame, tier2_pct: float = 0.10) -> pd.DataFrame:
-    """
-    Tier rules:
-    - AON -> Tier0
-    - Named majors -> Tier1
-    - Remaining OTHER -> Tier2 if top X% by Covered Lives; else Tier3
-    """
-    out = broker_agg.copy()
-    out["Tier"] = "Tier3"
-
-    out.loc[out["BrokerFamily"] == "AON", "Tier"] = "Tier0"
-    out.loc[out["BrokerFamily"].isin(list(TIER1_PATTERNS.keys())), "Tier"] = "Tier1"
-
-    mask_other = out["BrokerFamily"].eq("OTHER")
-    other = out[mask_other].copy()
-
-    if len(other) > 0:
-        thresh = other["CoveredLives"].quantile(1 - tier2_pct)
-        out.loc[mask_other & (out["CoveredLives"] >= thresh), "Tier"] = "Tier2"
-        out.loc[mask_other & (out["CoveredLives"] < thresh), "Tier"] = "Tier3"
-
-    return out
+# Matching rules live in etl/brokers.py, shared with scripts/export_dataset.py
+# so the dashboard and the exported workbook cannot disagree. AON is matched on
+# AON as a whole word (prefix, declared subsidiary, or named operating unit),
+# which keeps out SAMMAONS / GAONA / DATAONLINE while catching the ~97 AON
+# entities the old prefix-only rule scored as competitors.
 
 
 # =========================

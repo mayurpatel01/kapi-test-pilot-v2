@@ -29,6 +29,10 @@ DATA_DIR = REPO_ROOT / "data" / "marts"
 
 sys.path.insert(0, str(REPO_ROOT / "etl"))
 from benefits import VOLUNTARY_PRODUCTS
+from brokers import (
+    TIER1_PATTERNS, TIER_LABEL, assign_tiers, broker_family, is_aon_composite,
+    match_rule, norm,
+)
 
 
 def log(msg: str):
@@ -38,13 +42,7 @@ def log(msg: str):
 # =========================================================
 # Cleaning helpers (mirrors app.py)
 # =========================================================
-def norm(s) -> str:
-    if s is None:
-        return ""
-    s = str(s).upper().strip()
-    s = re.sub(r"[^\w\s]", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+# norm() is imported from etl/brokers.py -- see the import block above.
 
 
 def to_numeric(s: pd.Series) -> pd.Series:
@@ -87,71 +85,8 @@ def normalize_state(x) -> str:
     return STATE_NAME_TO_ABBR.get(s, s)
 
 
-# ---- Broker company-name matching ----
-AON_ROOTS = [
-    "AON CORPORATION",
-    "AON RISK SERVICES",
-    "AON HEWITT",
-    "AON CONSULTING",
-    "AON SOLUTIONS",
-]
-
-TIER1_PATTERNS = {
-    "MARSH": [r"\bMARSH\b", r"\bMARSH\s+MCLENNAN\b", r"\bMMC\b"],
-    "WTW": [r"\bWILLIS\b", r"\bTOWERS\b", r"\bWTW\b", r"\bWILLIS\s+TOWERS\s+WATSON\b"],
-    "GALLAGHER": [r"\bGALLAGHER\b", r"\bARTHUR\s+J\s+GALLAGHER\b"],
-    "BROWN & BROWN": [r"\bBROWN\b.*\bBROWN\b", r"\bBROWN\s*&\s*BROWN\b"],
-}
-
-
-def is_aon_composite(broker_name: str) -> bool:
-    n = norm(broker_name)
-    for root in AON_ROOTS:
-        r = norm(root)
-        # Must start with root to avoid DATAONLINE false positives
-        if re.match(rf"^{re.escape(r)}(\s+.*)?$", n):
-            return True
-    return False
-
-
-def match_any(patterns, text) -> bool:
-    return any(re.search(p, text) for p in patterns)
-
-
-def broker_family(broker_name: str) -> str:
-    n = norm(broker_name)
-    if not n:
-        return "UNKNOWN"
-    if is_aon_composite(n):
-        return "AON"
-    for fam, pats in TIER1_PATTERNS.items():
-        if match_any(pats, n):
-            return fam
-    return "OTHER"
-
-
-def assign_tiers(broker_agg: pd.DataFrame, tier2_pct: float = 0.10) -> pd.DataFrame:
-    """Tier0 = AON, Tier1 = named majors, Tier2 = top X% of 'Other' by lives, else Tier3."""
-    out = broker_agg.copy()
-    out["Tier"] = "Tier3"
-    out.loc[out["BrokerFamily"] == "AON", "Tier"] = "Tier0"
-    out.loc[out["BrokerFamily"].isin(list(TIER1_PATTERNS.keys())), "Tier"] = "Tier1"
-
-    mask_other = out["BrokerFamily"].eq("OTHER")
-    other = out[mask_other]
-    if len(other) > 0:
-        thresh = other["CoveredLives"].quantile(1 - tier2_pct)
-        out.loc[mask_other & (out["CoveredLives"] >= thresh), "Tier"] = "Tier2"
-        out.loc[mask_other & (out["CoveredLives"] < thresh), "Tier"] = "Tier3"
-    return out
-
-
-TIER_LABEL = {
-    "Tier0": "Tier0 - AON (incumbent)",
-    "Tier1": "Tier1 - Global major",
-    "Tier2": "Tier2 - Large regional/other",
-    "Tier3": "Tier3 - Small/local",
-}
+# Broker name matching and tiering live in etl/brokers.py so the dashboard and
+# this export cannot drift apart.
 
 
 # =========================================================
@@ -413,10 +348,7 @@ def build(tier2_pct: float = 0.10, comm_cap: float = 10_000_000.0, lives_cap: fl
            .rename(columns={"Broker": "BrokerNameAsFiled", "_norm": "NormalizedName"})
     )
     name_map["MatchedFamily"] = name_map["BrokerNameAsFiled"].apply(broker_family)
-    name_map["MatchRule"] = name_map["BrokerNameAsFiled"].apply(
-        lambda b: "AON composite (prefix match on AON roots)" if is_aon_composite(b)
-        else ("Tier1 major (keyword match)" if broker_family(b) != "OTHER" else "No match - OTHER")
-    )
+    name_map["MatchRule"] = name_map["BrokerNameAsFiled"].apply(match_rule)
     name_map = name_map.sort_values("Commissions", ascending=False)
 
     # ---- State summary (AON vs competitors)
@@ -509,6 +441,45 @@ def build(tier2_pct: float = 0.10, comm_cap: float = 10_000_000.0, lives_cap: fl
         .sort_values("CoveredLives", ascending=False)
     )
 
+    # ---- Per-product target lists: who to sell EACH voluntary product to.
+    # An employer qualifies for a product when they have an established benefits
+    # relationship (core coverage) but do not hold that specific product. Holding
+    # some other voluntary product is a positive signal, not a disqualifier -- it
+    # proves the group already buys worksite benefits.
+    vb_target_cols = ["Employer", "State", "CoveredLives", "TotalCommissions",
+                      "PrimaryBroker", "BrokerFamily", "BrokerTier", "TopCarrier",
+                      "ProductsHeld", "VBHeld"]
+    vb_targets = {}
+    has_core = employers["Has_Life"] | employers["Has_STD"] | employers["Has_LTD"]
+    for prod, col in [("Accident", "Has_Accident"), ("Critical Illness", "Has_CriticalIllness"),
+                      ("Hospital Indemnity", "Has_HospitalIndemnity"), ("Cancer", "Has_Cancer")]:
+        tgt = employers[has_core & ~employers[col]].copy()
+        # Already buys voluntary, just not this one -- the warmest subset.
+        tgt["AlreadyBuysVoluntary"] = tgt["Has_AnyVoluntary"]
+        vb_targets[prod] = (
+            tgt[vb_target_cols + ["AlreadyBuysVoluntary"]]
+            .sort_values(["AlreadyBuysVoluntary", "CoveredLives"], ascending=[False, False])
+        )
+
+    # ---- Per-product opportunity summary: sizes each product's gap in one view.
+    opp_rows = []
+    for prod, col in [("Accident", "Has_Accident"), ("Critical Illness", "Has_CriticalIllness"),
+                      ("Hospital Indemnity", "Has_HospitalIndemnity"), ("Cancer", "Has_Cancer")]:
+        tgt = vb_targets[prod]
+        warm = tgt[tgt["AlreadyBuysVoluntary"]]
+        opp_rows.append({
+            "Product": prod,
+            "EmployersHolding": int(employers[col].sum()),
+            "Penetration%": employers[col].mean() * 100.0,
+            "TargetEmployers": len(tgt),
+            "TargetLives": tgt["CoveredLives"].sum(),
+            "WarmTargets": len(warm),
+            "WarmTargetLives": warm["CoveredLives"].sum(),
+            "TargetsOnAONBook": int(tgt["BrokerFamily"].eq("AON").sum()),
+            "TargetsOnCompetitorBook": int((~tgt["BrokerFamily"].eq("AON")).sum()),
+        })
+    vb_opportunity = pd.DataFrame(opp_rows).sort_values("TargetLives", ascending=False)
+
     # ---- Voluntary benefits: carrier league table
     vb_carriers = (
         carrier_summary[carrier_summary["Product"].isin(VOLUNTARY_PRODUCTS)]
@@ -538,9 +509,14 @@ def build(tier2_pct: float = 0.10, comm_cap: float = 10_000_000.0, lives_cap: fl
     return {
         "employers": employers,
         "vb_penetration": vb_penetration,
+        "vb_opportunity": vb_opportunity,
         "vb_by_tier": vb_by_tier,
         "vb_whitespace": vb_whitespace,
         "vb_carriers": vb_carriers,
+        "vb_target_accident": vb_targets["Accident"],
+        "vb_target_ci": vb_targets["Critical Illness"],
+        "vb_target_hospital": vb_targets["Hospital Indemnity"],
+        "vb_target_cancer": vb_targets["Cancer"],
         "broker_summary": broker_agg[[
             "PrimaryBroker", "PrimaryBrokerNorm", "BrokerFamily", "TierLabel", "Employers", "CoveredLives",
             "LivesShare%", "EmployerShare%", "TotalCommissions",
@@ -633,6 +609,15 @@ def write_readme(writer, counts: dict, dq: dict, tier2_pct: float, with_detail: 
                           "under-index gap and broker fragmentation."),
         ("VB_Penetration", f"{counts['vb_penetration']:,} rows. Voluntary benefit take-up: employers, lives and "
                            "commissions for accident, critical illness, hospital indemnity and cancer."),
+        ("VB_Opportunity_By_Product", f"{counts['vb_opportunity']:,} rows. Sizes the sell-in gap for each voluntary "
+                                      "product: who holds it today, how many employers are addressable, and how many "
+                                      "of those already buy some other voluntary product (the warm subset)."),
+        ("Target_Accident", f"{counts['vb_target_accident']:,} rows. Named employers to sell ACCIDENT to - core "
+                            "coverage in place, no accident product. Sorted warm targets first, then by size."),
+        ("Target_CriticalIllness", f"{counts['vb_target_ci']:,} rows. Named employers to sell CRITICAL ILLNESS to."),
+        ("Target_HospitalIndemnity", f"{counts['vb_target_hospital']:,} rows. Named employers to sell HOSPITAL "
+                                     "INDEMNITY to."),
+        ("Target_Cancer", f"{counts['vb_target_cancer']:,} rows. Named employers to sell CANCER cover to."),
         ("VB_By_Broker_Tier", f"{counts['vb_by_tier']:,} rows. Voluntary attach rates by broker tier - shows which "
                               "tiers are leaving the voluntary line unsold."),
         ("VB_Crosssell_Targets", f"{counts['vb_whitespace']:,} rows. Employers holding core products (life and/or "
@@ -655,11 +640,15 @@ def write_readme(writer, counts: dict, dq: dict, tier2_pct: float, with_detail: 
     ws.write(r, 0, "Cleaning rules applied", h2); r += 1
     rules = [
         ("Broker name matching",
-         "Names are uppercased, punctuation stripped, whitespace collapsed. AON is matched as a composite: a name "
-         "counts as AON only if it STARTS WITH one of AON CORPORATION / AON RISK SERVICES / AON HEWITT / "
-         "AON CONSULTING / AON SOLUTIONS - this deliberately excludes false positives like DATAONLINE. "
+         "Names are uppercased, punctuation stripped, whitespace collapsed. AON is matched as a composite on three "
+         "rules, all requiring AON as a WHOLE WORD: (a) the name starts with AON, (b) the name declares itself an AON "
+         "subsidiary ('... AN AON COMPANY', '... (AON)'), or (c) it names an AON operating unit after a person or "
+         "office prefix. The word boundary is what excludes the real false positives, which contain the letters 'aon' "
+         "inside another word: SAMMAONS COMPANY LP, CHERYL LYNN GAONA, DATAONLINE. "
+         "Note DOL truncates filed broker names at 35 characters, so subsidiary suffixes arrive mangled ('AN AON "
+         "COMP') and the rules tolerate that. "
          "Tier1 majors (Marsh/MMC, WTW/Willis/Towers, Gallagher, Brown & Brown) are matched on word-boundary keywords. "
-         "Everything else is OTHER. See the Broker_Name_Matching sheet for the full mapping."),
+         "Everything else is OTHER. See the Broker_Name_Matching sheet for the full mapping and which rule fired."),
         ("Broker tiering",
          f"Tier0 = AON. Tier1 = named global majors. Tier2 = top {tier2_pct:.0%} of OTHER brokers by covered lives. "
          "Tier3 = the rest."),
@@ -749,6 +738,20 @@ def export(out_path: Path, tier2_pct: float, with_detail: bool, comm_cap: float,
             money_cols=("TotalCommissions",), int_cols=("Employers", "CoveredLives", "MedianLives"),
             pct_cols=("Employers%",),
         )
+        write_sheet(
+            writer, d["vb_opportunity"], "VB_Opportunity_By_Product",
+            int_cols=("EmployersHolding", "TargetEmployers", "TargetLives", "WarmTargets",
+                      "WarmTargetLives", "TargetsOnAONBook", "TargetsOnCompetitorBook"),
+            pct_cols=("Penetration%",),
+        )
+        for sheet, key in [("Target_Accident", "vb_target_accident"),
+                           ("Target_CriticalIllness", "vb_target_ci"),
+                           ("Target_HospitalIndemnity", "vb_target_hospital"),
+                           ("Target_Cancer", "vb_target_cancer")]:
+            write_sheet(
+                writer, d[key], sheet,
+                money_cols=("TotalCommissions",), int_cols=("CoveredLives",),
+            )
         write_sheet(
             writer, d["vb_by_tier"], "VB_By_Broker_Tier",
             int_cols=("Employers", "CoveredLives"),
