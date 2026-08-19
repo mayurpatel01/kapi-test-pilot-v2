@@ -325,6 +325,17 @@ g["LifeOnly_NoDis_f"] = g["Life_f"] & (~g["Dis_f"])
 g["DisOnly_NoLife_f"] = g["Dis_f"] & (~g["Life_f"])
 g["MissingAny_f"] = (~g["Life_f"]) | (~g["STD_f"]) | (~g["LTD_f"])
 
+# Voluntary benefit flags. These come from the Schedule A OTHER free text rather
+# than a checkbox - see etl/benefits.py. AD&D is kept separate from Accident on
+# purpose; folding it in roughly doubles apparent VB penetration.
+VB_PRODUCTS = ["Accident", "Critical Illness", "Hospital Indemnity", "Cancer"]
+for prod in VB_PRODUCTS + ["AD&D"]:
+    g[f"{prod}_f"] = as_flag(g[prod]) if prod in g.columns else False
+
+g["AnyVB_f"] = g["Accident_f"] | g["Critical Illness_f"] | g["Hospital Indemnity_f"] | g["Cancer_f"]
+g["VBTrio_f"] = g["Accident_f"] & g["Critical Illness_f"] & g["Hospital Indemnity_f"]
+g["CoreNoVB_f"] = (g["Life_f"] | g["Dis_f"]) & (~g["AnyVB_f"])
+
 # Geo merge (State/City)
 geo_use = geo.copy()
 for col in ["State", "City"]:
@@ -717,6 +728,68 @@ with tab_whitespace:
 
     st.dataframe(tier_attach.reset_index(drop=True), use_container_width=True)
 
+    # ---------------------------------------------------------
+    # Voluntary benefits
+    # ---------------------------------------------------------
+    st.markdown("---")
+    st.subheader("Voluntary Benefits (Accident / Critical Illness / Hospital Indemnity / Cancer)")
+    st.caption(
+        "Voluntary products have no Schedule A checkbox - they are parsed out of the OTHER free-text field, "
+        "so these counts are a floor rather than an exact census. AD&D is shown separately because it is a life "
+        "rider, not a worksite product; counting it as 'accident' roughly doubles apparent penetration."
+    )
+
+    vb_rows = []
+    n_emp = tmp["Employer"].nunique()
+    for label, col in [("Accident", "Accident_f"), ("Critical Illness", "Critical Illness_f"),
+                       ("Hospital Indemnity", "Hospital Indemnity_f"), ("Cancer", "Cancer_f"),
+                       ("Any of the four", "AnyVB_f"), ("Acc + CI + Hosp (all three)", "VBTrio_f"),
+                       ("AD&D (not a VB)", "AD&D_f")]:
+        sel = tmp[tmp[col]]
+        vb_rows.append({
+            "Product": label,
+            "Employers": sel["Employer"].nunique(),
+            "Penetration": (sel["Employer"].nunique() / n_emp) if n_emp else 0.0,
+            "Lives": sel["CoveredLives"].sum(),
+        })
+    vb_pen = pd.DataFrame(vb_rows)
+
+    c1, c2 = st.columns([2, 3])
+    with c1:
+        st.markdown("#### Penetration")
+        figv = px.bar(vb_pen[vb_pen["Product"] != "AD&D (not a VB)"], x="Product", y="Penetration")
+        figv.update_layout(yaxis_tickformat=".0%", xaxis_title=None)
+        st.plotly_chart(figv, use_container_width=True)
+    with c2:
+        st.markdown("#### Voluntary attach rate by broker tier")
+        vb_tier = (
+            tmp.groupby("BrokerTier", as_index=False)
+               .agg(Accident=("Accident_f", "mean"),
+                    CriticalIllness=("Critical Illness_f", "mean"),
+                    HospitalIndemnity=("Hospital Indemnity_f", "mean"),
+                    AnyVB=("AnyVB_f", "mean"))
+        )
+        figt = px.bar(
+            vb_tier.melt(id_vars=["BrokerTier"],
+                         value_vars=["Accident", "CriticalIllness", "HospitalIndemnity", "AnyVB"]),
+            x="BrokerTier", y="value", color="variable", barmode="group",
+        )
+        figt.update_layout(yaxis_tickformat=".0%", xaxis_title=None, yaxis_title=None)
+        st.plotly_chart(figt, use_container_width=True)
+
+    st.dataframe(vb_pen, use_container_width=True)
+
+    st.markdown("### Voluntary cross-sell targets")
+    st.caption("Employers holding life and/or disability with no voluntary product attached.")
+    vb_targets = (
+        tmp[tmp["CoreNoVB_f"]][
+            ["Employer", "StateNorm", "CoveredLives", "TotalCommissions", "PrimaryBroker", "BrokerFamily", "BrokerTier"]
+        ].sort_values("CoveredLives", ascending=False)
+    )
+    st.metric("Employers with core products but zero voluntary", f"{len(vb_targets):,}")
+    st.dataframe(vb_targets.head(300).reset_index(drop=True), use_container_width=True)
+
+    st.markdown("---")
     st.markdown("### Whitespace distribution by state")
     if tmp["StateNorm"].notna().any():
         state_ws = (

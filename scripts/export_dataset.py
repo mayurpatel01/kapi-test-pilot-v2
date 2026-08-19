@@ -18,6 +18,7 @@ matches what the dashboard shows. If you change them in one place, change both.
 import argparse
 import math
 import re
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -25,6 +26,9 @@ import pandas as pd
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = REPO_ROOT / "data" / "marts"
+
+sys.path.insert(0, str(REPO_ROOT / "etl"))
+from benefits import VOLUNTARY_PRODUCTS
 
 
 def log(msg: str):
@@ -265,6 +269,23 @@ def build(tier2_pct: float = 0.10, comm_cap: float = 10_000_000.0, lives_cap: fl
     g["DisOnly_NoLife_f"] = g["Dis_f"] & (~g["Life_f"])
     g["MissingAny_f"] = (~g["Life_f"]) | (~g["STD_f"]) | (~g["LTD_f"])
 
+    # ---- Voluntary benefit flags (parsed from Schedule A OTHER free text)
+    for prod in VOLUNTARY_PRODUCTS + ["AD&D", "Long Term Care", "Legal"]:
+        g[f"{prod}_f"] = as_flag(g[prod]) if prod in g.columns else False
+
+    g["AnyVB_f"] = (
+        g["Accident_f"] | g["Critical Illness_f"] | g["Hospital Indemnity_f"] | g["Cancer_f"]
+    )
+    g["VBCount"] = (
+        g["Accident_f"].astype(int) + g["Critical Illness_f"].astype(int)
+        + g["Hospital Indemnity_f"].astype(int) + g["Cancer_f"].astype(int)
+    )
+    # The classic worksite trio sold together.
+    g["VBTrio_f"] = g["Accident_f"] & g["Critical Illness_f"] & g["Hospital Indemnity_f"]
+    # Core-but-no-VB is the cross-sell target: an established group benefits
+    # relationship with none of the voluntary line attached.
+    g["CoreNoVB_f"] = (g["Life_f"] | g["Dis_f"]) & (~g["AnyVB_f"])
+
     # ---- Geo, with state normalization
     geo_use = geo.copy()
     for col in ["State", "City", "ZIP", "EIN"]:
@@ -336,8 +357,18 @@ def build(tier2_pct: float = 0.10, comm_cap: float = 10_000_000.0, lives_cap: fl
         miss = [p for p, f in [("Life", r["Life_f"]), ("STD", r["STD_f"]), ("LTD", r["LTD_f"])] if not f]
         return " + ".join(miss) if miss else "(complete - all 3)"
 
+    def vb_held(r):
+        held = [p for p in VOLUNTARY_PRODUCTS if r[f"{p}_f"]]
+        return " + ".join(held) if held else "(none)"
+
+    def vb_missing(r):
+        miss = [p for p in VOLUNTARY_PRODUCTS if not r[f"{p}_f"]]
+        return " + ".join(miss) if miss else "(complete - all 4)"
+
     emp["ProductsHeld"] = emp.apply(products_held, axis=1)
     emp["ProductsMissing"] = emp.apply(products_missing, axis=1)
+    emp["VBHeld"] = emp.apply(vb_held, axis=1)
+    emp["VBMissing"] = emp.apply(vb_missing, axis=1)
     emp["LivesLog"] = emp["CoveredLives"].apply(lambda x: math.log(float(x) + 1.0))
 
     employers = emp.rename(columns={
@@ -349,6 +380,16 @@ def build(tier2_pct: float = 0.10, comm_cap: float = 10_000_000.0, lives_cap: fl
         "LifeOnly_NoDis_f": "LifeOnly_NoDisability",
         "DisOnly_NoLife_f": "DisabilityOnly_NoLife",
         "MissingAny_f": "MissingAnyProduct",
+        "Accident_f": "Has_Accident",
+        "Critical Illness_f": "Has_CriticalIllness",
+        "Hospital Indemnity_f": "Has_HospitalIndemnity",
+        "Cancer_f": "Has_Cancer",
+        "AD&D_f": "Has_ADandD",
+        "Long Term Care_f": "Has_LongTermCare",
+        "Legal_f": "Has_Legal",
+        "AnyVB_f": "Has_AnyVoluntary",
+        "VBTrio_f": "Has_VoluntaryTrio",
+        "CoreNoVB_f": "CoreButNoVoluntary",
     })[[
         "Employer", "State", "City", "ZIP", "EIN",
         "PrimaryBroker", "PrimaryBrokerNorm", "BrokerFamily", "BrokerTier",
@@ -357,6 +398,10 @@ def build(tier2_pct: float = 0.10, comm_cap: float = 10_000_000.0, lives_cap: fl
         "Has_Life", "Has_STD", "Has_LTD",
         "ProductsHeld", "ProductsMissing",
         "Has_Life_And_Disability", "LifeOnly_NoDisability", "DisabilityOnly_NoLife", "MissingAnyProduct",
+        "Has_Accident", "Has_CriticalIllness", "Has_HospitalIndemnity", "Has_Cancer",
+        "VBCount", "VBHeld", "VBMissing",
+        "Has_AnyVoluntary", "Has_VoluntaryTrio", "CoreButNoVoluntary",
+        "Has_ADandD", "Has_LongTermCare", "Has_Legal",
     ]].sort_values("CoveredLives", ascending=False)
     employers["BrokerTier"] = employers["BrokerTier"].map(TIER_LABEL).fillna(employers["BrokerTier"])
 
@@ -404,8 +449,9 @@ def build(tier2_pct: float = 0.10, comm_cap: float = 10_000_000.0, lives_cap: fl
     state_summary = state_summary.sort_values("CoveredLives", ascending=False)
 
     # ---- Carrier x product summary
+    group_col = ["ProductGroup"] if "ProductGroup" in epc.columns else []
     carrier_summary = (
-        epc.groupby(["Carrier", "Product"], as_index=False)
+        epc.groupby(["Carrier", "Product"] + group_col, as_index=False)
            .agg(Employers=("Employer", "nunique"), CoveredLives=("Covered_Lives", "sum"))
            .sort_values(["Product", "CoveredLives"], ascending=[True, False])
     )
@@ -419,6 +465,63 @@ def build(tier2_pct: float = 0.10, comm_cap: float = 10_000_000.0, lives_cap: fl
     )
     whitespace["Employers%"] = whitespace["Employers"] / whitespace["Employers"].sum() * 100.0
 
+    # ---- Voluntary benefits: penetration by product
+    vb_rows = []
+    n_emp = len(employers)
+    for prod, col in [("Accident", "Has_Accident"), ("Critical Illness", "Has_CriticalIllness"),
+                      ("Hospital Indemnity", "Has_HospitalIndemnity"), ("Cancer", "Has_Cancer"),
+                      ("--- ANY of the four ---", "Has_AnyVoluntary"),
+                      ("--- ALL of Acc+CI+Hosp ---", "Has_VoluntaryTrio"),
+                      ("AD&D (not a VB - shown for contrast)", "Has_ADandD"),
+                      ("Long Term Care", "Has_LongTermCare"), ("Legal", "Has_Legal")]:
+        sel = employers[employers[col]]
+        vb_rows.append({
+            "Product": prod,
+            "Employers": len(sel),
+            "Employers%": len(sel) / n_emp * 100.0 if n_emp else 0.0,
+            "CoveredLives": sel["CoveredLives"].sum(),
+            "TotalCommissions": sel["TotalCommissions"].sum(),
+            "MedianLives": sel["CoveredLives"].median() if len(sel) else 0.0,
+        })
+    vb_penetration = pd.DataFrame(vb_rows)
+
+    # ---- Voluntary benefits: attach-rate gap by broker tier
+    # This is the sheet that answers "who is leaving VB on the table".
+    vb_by_tier = (
+        employers.groupby("BrokerTier", as_index=False)
+                 .agg(Employers=("Employer", "nunique"), CoveredLives=("CoveredLives", "sum"),
+                      AccidentRate=("Has_Accident", "mean"),
+                      CriticalIllnessRate=("Has_CriticalIllness", "mean"),
+                      HospitalIndemnityRate=("Has_HospitalIndemnity", "mean"),
+                      AnyVBRate=("Has_AnyVoluntary", "mean"),
+                      CoreNoVBRate=("CoreButNoVoluntary", "mean"))
+                 .sort_values("CoveredLives", ascending=False)
+    )
+    for c in ["AccidentRate", "CriticalIllnessRate", "HospitalIndemnityRate", "AnyVBRate", "CoreNoVBRate"]:
+        vb_by_tier[c.replace("Rate", "%")] = vb_by_tier.pop(c) * 100.0
+
+    # ---- Voluntary benefits: the cross-sell target list
+    # Employers with an established core relationship and zero voluntary attached.
+    vb_whitespace = (
+        employers[employers["CoreButNoVoluntary"]]
+        [["Employer", "State", "CoveredLives", "TotalCommissions", "PrimaryBroker",
+          "BrokerFamily", "BrokerTier", "ProductsHeld", "TopCarrier"]]
+        .sort_values("CoveredLives", ascending=False)
+    )
+
+    # ---- Voluntary benefits: carrier league table
+    vb_carriers = (
+        carrier_summary[carrier_summary["Product"].isin(VOLUNTARY_PRODUCTS)]
+        .pivot_table(index="Carrier", columns="Product", values="Employers", aggfunc="sum", fill_value=0)
+        .reset_index()
+    )
+    for p in VOLUNTARY_PRODUCTS:
+        if p not in vb_carriers.columns:
+            vb_carriers[p] = 0
+    vb_carriers["TotalVBEmployers"] = vb_carriers[VOLUNTARY_PRODUCTS].sum(axis=1)
+    vb_carriers = vb_carriers[["Carrier"] + VOLUNTARY_PRODUCTS + ["TotalVBEmployers"]] \
+        .sort_values("TotalVBEmployers", ascending=False)
+
     # ---- Detail sheets
     detail_broker = (
         ebc[["Employer", "Broker", "total_commissions", "ACK_ID"]]
@@ -427,13 +530,17 @@ def build(tier2_pct: float = 0.10, comm_cap: float = 10_000_000.0, lives_cap: fl
         .sort_values("CommissionsPaid", ascending=False)
     )
     detail_carrier = (
-        epc[["Employer", "Product", "Carrier", "Covered_Lives", "ACK_ID"]]
+        epc[["Employer", "Product"] + group_col + ["Carrier", "Covered_Lives", "ACK_ID"]]
         .rename(columns={"Covered_Lives": "CoveredLives", "ACK_ID": "FilingID"})
         .sort_values("CoveredLives", ascending=False)
     )
 
     return {
         "employers": employers,
+        "vb_penetration": vb_penetration,
+        "vb_by_tier": vb_by_tier,
+        "vb_whitespace": vb_whitespace,
+        "vb_carriers": vb_carriers,
         "broker_summary": broker_agg[[
             "PrimaryBroker", "PrimaryBrokerNorm", "BrokerFamily", "TierLabel", "Employers", "CoveredLives",
             "LivesShare%", "EmployerShare%", "TotalCommissions",
@@ -524,6 +631,13 @@ def write_readme(writer, counts: dict, dq: dict, tier2_pct: float, with_detail: 
                                  "name as filed, its normalized form, the family it matched, and which rule fired."),
         ("State_Summary", f"{counts['state_summary']:,} rows. Per-state totals, AON vs competitor share, "
                           "under-index gap and broker fragmentation."),
+        ("VB_Penetration", f"{counts['vb_penetration']:,} rows. Voluntary benefit take-up: employers, lives and "
+                           "commissions for accident, critical illness, hospital indemnity and cancer."),
+        ("VB_By_Broker_Tier", f"{counts['vb_by_tier']:,} rows. Voluntary attach rates by broker tier - shows which "
+                              "tiers are leaving the voluntary line unsold."),
+        ("VB_Crosssell_Targets", f"{counts['vb_whitespace']:,} rows. Employers holding core products (life and/or "
+                                 "disability) with NO voluntary benefit attached - the cross-sell list."),
+        ("VB_Carriers", f"{counts['vb_carriers']:,} rows. Carrier league table for voluntary products only."),
         ("Carrier_Product_Summary", f"{counts['carrier_summary']:,} rows. Carrier x product footprint by employers and lives."),
         ("Product_Whitespace", f"{counts['whitespace']:,} rows. Employer counts by product combination held (gap analysis)."),
         ("Data_Quality_Flags", f"{counts['data_quality_flags']:,} rows. Every source row excluded as an implausible "
@@ -561,6 +675,16 @@ def write_readme(writer, counts: dict, dq: dict, tier2_pct: float, with_detail: 
         ("State normalization",
          "Full state names mapped to 2-letter codes; anything outside the 50 states + DC + PR is blanked rather than "
          "counted as its own state."),
+        ("Voluntary benefit derivation (IMPORTANT)",
+         "Schedule A has a checkbox for life, STD, LTD, health, dental, vision etc. but NOT for voluntary products. "
+         "Critical illness, accident and hospital indemnity are all filed under the OTHER checkbox with a free-text "
+         "label (WLFR_TYPE_BNFT_OTH_TEXT), which is why OTHER is the most-used box on the form. Those labels are "
+         "comma-separated lists ('ACCIDENT, CRITICAL ILLNESS, HOSPITAL'), so the text is split into individual "
+         "benefits before matching, and each product is counted once per filing. "
+         "AD&D IS DELIBERATELY EXCLUDED FROM 'ACCIDENT': 'ACCIDENTAL DEATH AND DISMEMBERMENT' appears in ~46,000 "
+         "filings, nearly double the entire real voluntary universe, and folding it in would roughly double apparent "
+         "market size. It is reported as its own product on VB_Penetration for contrast. Free text that matches no "
+         "rule (EAP, telehealth, supplemental life, wellness) is not counted as a product."),
         ("Outlier removal (IMPORTANT)",
          f"Form 5500 is self-reported and a few filings contain keying errors large enough to swamp every total. "
          f"As filed, total commissions came to ${dq['comm_raw_total']:,.0f} - because ONE row reported $563 trillion. "
@@ -579,7 +703,17 @@ def write_readme(writer, counts: dict, dq: dict, tier2_pct: float, with_detail: 
     caveats = [
         "Employers are keyed on the sponsor name as filed - separate legal entities of the same parent appear as "
         "separate rows. No parent-company roll-up has been applied.",
-        "Only Life, STD and LTD lines are in scope; medical/dental/vision are excluded.",
+        "Core products in scope are Life, STD and LTD, plus the voluntary products parsed from the OTHER free text; "
+        "medical/dental/vision are excluded.",
+        "Voluntary products are identified from free text, so coverage depends on how each filer described the plan. "
+        "A filer who wrote nothing in the OTHER box will look like they have no voluntary benefit even if they do - "
+        "treat the voluntary counts as a floor, not an exact census.",
+        "Covered lives cannot be split by benefit within a filing. A Schedule A row listing 'ACCIDENT, CRITICAL "
+        "ILLNESS, HOSPITAL' reports one covered-lives figure, so the same population is attributed to all three. "
+        "Use it to answer 'who holds this product', not to sum lives across products.",
+        "Commissions cannot be attributed to voluntary products specifically - they sit at filing/broker grain with "
+        "no benefit dimension. Commission figures on the VB sheets are the employer's TOTAL commissions, not the "
+        "voluntary portion.",
         "2024 filings only - a plan that did not file in 2024 will not appear.",
         "Commissions are as reported on Schedule A and vary in completeness by filer.",
         "PrimaryBroker = UNKNOWN means the employer has carrier/product coverage but no broker commission record on "
@@ -609,6 +743,24 @@ def export(out_path: Path, tier2_pct: float, with_detail: bool, comm_cap: float,
             money_cols=("TotalCommissions", "MedianCommissionPerEmployer", "MeanCommissionPerEmployer"),
             int_cols=("Employers", "CoveredLives"),
             pct_cols=("LivesShare%", "EmployerShare%"),
+        )
+        write_sheet(
+            writer, d["vb_penetration"], "VB_Penetration",
+            money_cols=("TotalCommissions",), int_cols=("Employers", "CoveredLives", "MedianLives"),
+            pct_cols=("Employers%",),
+        )
+        write_sheet(
+            writer, d["vb_by_tier"], "VB_By_Broker_Tier",
+            int_cols=("Employers", "CoveredLives"),
+            pct_cols=("Accident%", "CriticalIllness%", "HospitalIndemnity%", "AnyVB%", "CoreNoVB%"),
+        )
+        write_sheet(
+            writer, d["vb_whitespace"], "VB_Crosssell_Targets",
+            money_cols=("TotalCommissions",), int_cols=("CoveredLives",),
+        )
+        write_sheet(
+            writer, d["vb_carriers"], "VB_Carriers",
+            int_cols=tuple(VOLUNTARY_PRODUCTS) + ("TotalVBEmployers",),
         )
         write_sheet(
             writer, d["name_map"], "Broker_Name_Matching",

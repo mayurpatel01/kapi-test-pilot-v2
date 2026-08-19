@@ -5,6 +5,11 @@ from pathlib import Path
 
 import pandas as pd
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from benefits import ALL_PRODUCTS, PRODUCT_GROUP, explode_other_text
+
+OTHER_TEXT_COL = "WLFR_TYPE_BNFT_OTH_TEXT"
+
 
 def log(msg: str):
     print(f"[build_marts] {msg}")
@@ -125,15 +130,34 @@ def build_marts(zip_a: Path, zip_b: Path, zip_c: Path, out_dir: Path):
     df_b["IS_STD"] = coerce_indicator(df_b[ind_std]) if ind_std in df_b.columns else 0
     df_b["IS_LTD"] = coerce_indicator(df_b[ind_ltd]) if ind_ltd in df_b.columns else 0
 
-    # Expand into long rows by product
+    # Expand into long rows by product -- checkbox products first
     parts = []
     for prod, flag in [("Life", "IS_LIFE"), ("STD", "IS_STD"), ("LTD", "IS_LTD")]:
         tmp = df_b[df_b[flag] == 1][["ACK_ID", "Carrier", "Covered_Lives"]].copy()
         tmp["Product"] = prod
         parts.append(tmp)
 
+    # ...then the voluntary products, which have no checkbox and must be parsed
+    # out of the OTHER free text. See etl/benefits.py for why AD&D is separated.
+    if OTHER_TEXT_COL in df_b.columns:
+        vb = explode_other_text(
+            df_b,
+            text_col=OTHER_TEXT_COL,
+            keep_cols=["ACK_ID", "Carrier", "Covered_Lives"],
+        )
+        log(f"Parsed {len(vb):,} product rows from OTHER free text "
+            f"({vb['ACK_ID'].nunique():,} filings, {vb['Product'].nunique()} distinct products)")
+        parts.append(vb)
+    else:
+        log(f"Warning: {OTHER_TEXT_COL} missing -- voluntary products will be absent")
+
     b_long = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=["ACK_ID", "Carrier", "Covered_Lives", "Product"])
     b_long = b_long.drop_duplicates()
+    b_long["ProductGroup"] = b_long["Product"].map(PRODUCT_GROUP).fillna("Other")
+
+    for grp in ["Core", "Voluntary", "Adjacent"]:
+        sel = b_long[b_long["ProductGroup"] == grp]
+        log(f"  {grp:<10} {len(sel):>8,} rows  {sel['ACK_ID'].nunique():>7,} filings")
 
     # Attach employer labels
     employer_product_carrier = b_long.merge(df_a, on="ACK_ID", how="left")
@@ -152,10 +176,12 @@ def build_marts(zip_a: Path, zip_b: Path, zip_c: Path, out_dir: Path):
         .pivot_table(index="Employer", columns="Product", values="flag", aggfunc="max", fill_value=0)
         .reset_index()
     )
-    for col in ["Life", "STD", "LTD"]:
+    # Keep every known product as a column even when nothing matched, so the
+    # downstream schema is stable regardless of what a given filing year contains.
+    for col in ALL_PRODUCTS:
         if col not in matrix.columns:
             matrix[col] = 0
-    matrix = matrix[["Employer", "Life", "STD", "LTD"]]
+    matrix = matrix[["Employer"] + ALL_PRODUCTS]
 
     out_matrix = out_dir / "employer_product_matrix.parquet"
     log(f"Writing {out_matrix}")
@@ -215,12 +241,12 @@ def build_marts(zip_a: Path, zip_b: Path, zip_c: Path, out_dir: Path):
 
     # Carrier summary (presence + lives)
     carrier_summary = (
-        employer_product_carrier.groupby(["Carrier", "Product"], as_index=False)
+        employer_product_carrier.groupby(["Carrier", "Product", "ProductGroup"], as_index=False)
         .agg(
             unique_employers=("Employer", "nunique"),
             covered_lives=("Covered_Lives", "sum"),
         )
-        .sort_values(["Product", "covered_lives"], ascending=[True, False])
+        .sort_values(["ProductGroup", "Product", "covered_lives"], ascending=[True, True, False])
     )
     out_carrier_sum = out_dir / "carrier_product_summary.parquet"
     log(f"Writing {out_carrier_sum}")
