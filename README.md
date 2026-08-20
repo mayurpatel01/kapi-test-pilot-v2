@@ -1,9 +1,15 @@
 # Voluntary Benefits Intelligence (Form 5500)
 
-Streamlit dashboard and Excel export built on DOL Form 5500 + Schedule A, 2024
-latest filings. Scope is group benefits and the voluntary line — AON does not
-sell medical, dental or vision, so those are excluded from the pipeline
-entirely.
+Streamlit dashboard and Excel export built on DOL Form 5500 + Schedule A. Scope
+is group benefits and the voluntary line — AON does not sell medical, dental or
+vision, so those are excluded from the pipeline entirely.
+
+**The data covers plan year 2024, filed during 2025.** The DOL release is named
+"2024 Latest" and the two years are easy to confuse: 96.2% of filings have a
+plan year beginning in 2024, while 97.9% were *received* by DOL during calendar
+2025 (the rest by January 2026). So this is the most recent complete year of
+filings — not a 2025 view of the market. "Latest" means the most recent version
+of each filing, so amendments supersede originals.
 
 ## Running it
 

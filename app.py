@@ -45,7 +45,8 @@ st.set_page_config(
 
 st.title("Voluntary Benefits Intelligence Insights (Form 5500)")
 st.caption(
-    "AON vs competitors decision engine: market share, whitespace, robust diagnostics, and target scoring from Form 5500."
+    "Plan year 2024 (filed with DOL during 2025) — the most recent complete year of Form 5500 filings. "
+    "AON vs competitors decision engine: market share, whitespace, robust diagnostics, and target scoring."
 )
 
 DATA_DIR = Path("data/marts")

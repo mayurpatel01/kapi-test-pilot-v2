@@ -809,7 +809,13 @@ def write_readme(writer, counts: dict, dq: dict, tier2_pct: float, with_detail: 
     ws.write(r, 0, "KAPI Pilot - Cleaned Dataset", title); r += 2
     ws.write(r, 0, "Generated", bold); ws.write(r, 1, datetime.now().strftime("%Y-%m-%d %H:%M")); r += 1
     ws.write(r, 0, "Source", bold)
-    ws.write(r, 1, "DOL Form 5500 + Schedule A, 2024 latest filings (F_5500, F_SCH_A, F_SCH_A_PART1)", wrap); r += 2
+    ws.write(r, 1, "DOL Form 5500 + Schedule A (F_5500, F_SCH_A, F_SCH_A_PART1), 2024 'Latest' release", wrap); r += 1
+    ws.write(r, 0, "Period covered", bold)
+    ws.write(r, 1, "PLAN YEAR 2024. 96.2% of filings have a plan year beginning in 2024; the rest are late or "
+                   "amended filings for earlier years. These were SUBMITTED to DOL during 2025 (97.9% received "
+                   "in calendar 2025, the remainder by January 2026), which is why the coverage year and the "
+                   "filing year differ. 'Latest' means the most recent version of each filing, so amendments "
+                   "supersede originals.", wrap); r += 2
 
     ws.write(r, 0, "Sheets", h2); r += 1
     sheets = [
@@ -960,7 +966,8 @@ def write_readme(writer, counts: dict, dq: dict, tier2_pct: float, with_detail: 
         "populated) falling back to WLFR_TOT_CHARGES_PAID_AMT ('total charges paid for this contract', ~78% "
         "populated). Together they cover ~84% of Schedule A rows. Employers with no premium figure are not "
         "premium-free - the filer simply left both boxes empty, so PremiumPerLife is left BLANK rather than zero.",
-        "2024 filings only - a plan that did not file in 2024 will not appear.",
+        "Plan year 2024 only - a plan that did not file for 2024 will not appear. Note the filings themselves were "
+        "submitted during 2025, so this is the most recent complete year available, not a 2025 view of the market.",
         "Commissions are as reported on Schedule A and vary in completeness by filer.",
         "PrimaryBroker = UNKNOWN means the employer has carrier/product coverage but no broker commission record on "
         "Schedule A Part 1 - not that the employer has no broker. Those rows still carry valid covered-lives data.",
