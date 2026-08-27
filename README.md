@@ -48,6 +48,57 @@ Marts in `data/marts/` **are** committed on purpose: Streamlit Cloud builds from
 the repo and never runs the ETL, so an untracked mart does not exist in the
 deployed app. Commit them after rebuilding.
 
+## Multi-year: what is available, and when
+
+DOL names each release for the **plan year**, not the filing year, and filings
+arrive over roughly two years. Verified across three releases:
+
+| Plan year | Filings held | State | Received between |
+|---|---:|---|---|
+| 2023 | 223,028 | complete | 2024-01-01 .. 2026-07-25 |
+| 2024 | 193,986 | ~87% | 2025-01-01 .. 2026-01-24 |
+| 2025 | 57,161 | **~26%** | 2026-01-02 .. 2026-07-25 |
+
+**Plan year 2025 is about a quarter of a year and must not be trended against a
+complete year.** Only 35.6% of a year files by the on-time deadline; the
+mid-October extension deadline is where ~37% of the year lands in a single
+month. Worse, the missing filings are not a random sample — at this point in
+the 2024 cycle the data held 40% of filings but only **34% of covered lives**,
+because large complex plans take extensions (mean group size 1,062 lives for
+early filers against 3,090 for late ones). Comparing a partial year to a
+complete one shows a fake collapse concentrated in exactly the large accounts
+that matter most.
+
+Plan year 2025 becomes usable around **November 2026**, complete by roughly
+February 2027. For trend analysis now, go backwards: 2021–2023 are complete.
+
+If an early 2025 read is needed sooner, compare **cohorts at the same point in
+the cycle** — 2024 filings received by 21 Aug 2025 against 2025 filings received
+by 21 Aug 2026. Both carry the same bias, so the comparison is valid, but those
+figures must never be mixed with full-year numbers.
+
+Note also that DOL keeps adding late and amended filings to *closed* years, so
+re-running the ETL on a fresh download will not reproduce existing marts
+exactly. The 2023 file was still receiving filings in July 2026.
+
+### Before building trend views: key on EIN, not name
+
+The pipeline currently keys employers on sponsor name as filed. That is not
+safe across years, and measured on 2023 vs 2024:
+
+- `SPONS_DFE_EIN` is populated on **100%** of filings in both years.
+- EIN carries over better than name — 92.6% against 90.6%.
+- **5.9% of carried-over companies (7,291) changed their filed name between
+  years** — `TERUMO BCT` to `TERUMO BLOOD AND CELL TECHNOLOGIES INC`,
+  `G W LISK COMPANY INC` to `G W LISK COMPANY`. Tracking by name reads every one
+  of those as a lost account.
+- 1,719 names map to more than one EIN *within a single year*, so a name is not
+  a unique key even before any trend work.
+
+The good news: schema is stable across 2023/2024/2025 — every column the ETL
+depends on is present in all three — and the `(ACK_ID, FORM_ID)` commission join
+holds at 100% in every year, so per-product commission works throughout.
+
 ## Excel export
 
 ```bash

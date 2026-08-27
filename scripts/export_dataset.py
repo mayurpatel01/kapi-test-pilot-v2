@@ -1036,7 +1036,14 @@ def write_readme(writer, counts: dict, dq: dict, tier2_pct: float, with_detail: 
                    "amended filings for earlier years. These were SUBMITTED to DOL during 2025 (97.9% received "
                    "in calendar 2025, the remainder by January 2026), which is why the coverage year and the "
                    "filing year differ. 'Latest' means the most recent version of each filing, so amendments "
-                   "supersede originals.", wrap); r += 2
+                   "supersede originals.", wrap); r += 1
+    ws.write(r, 0, "Why not 2025?", bold)
+    ws.write(r, 1, "Plan year 2025 exists but is only about 26% filed as of August 2026 (57,161 filings against "
+                   "223,028 for a complete year). Only ~36% of a year files by the on-time deadline and the "
+                   "mid-October extension deadline carries ~37% more, so 2025 is not comparable to a complete year "
+                   "until around November 2026. The gap is also biased: large complex plans take extensions, so an "
+                   "early pull holds 40% of filings but only 34% of covered lives. Trending 2024 against a partial "
+                   "2025 would show a false decline concentrated in the largest accounts.", wrap); r += 2
 
     ws.write(r, 0, "Sheets", h2); r += 1
     sheets = [
