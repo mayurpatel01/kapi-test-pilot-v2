@@ -10,7 +10,12 @@ data/raw/
 # employer_contract (premium) out of production while the older marts stayed
 # tracked from before the rule existed. Ignore stray parquet elsewhere instead.
 *.parquet
+# Both patterns are needed: the first covers data/marts/trend_summary.parquet,
+# the second the per-plan-year partitions in data/marts/<year>/. A single
+# data/marts/*.parquet does NOT reach into subdirectories, which silently kept
+# every year partition out of the deploy.
 !data/marts/*.parquet
+!data/marts/**/*.parquet
 
 # Generated Excel exports (regenerate with scripts/export_dataset.py)
 exports/
