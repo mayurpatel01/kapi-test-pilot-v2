@@ -22,13 +22,16 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = REPO_ROOT / "data" / "marts"
 
 sys.path.insert(0, str(REPO_ROOT / "etl"))
-from benefits import ALL_PRODUCTS, PRODUCT_GROUP, VB_TRIO, VOLUNTARY_PRODUCTS, column_suffix
+from benefits import (
+    ALL_PRODUCTS, CORE_PRODUCTS, PRODUCT_GROUP, VB_TRIO, VOLUNTARY_PRODUCTS, column_suffix,
+)
 from brokers import (
     TIER1_PATTERNS, TIER_LABEL, assign_tiers, broker_family, is_aon_composite,
     match_rule, norm,
@@ -606,6 +609,162 @@ def build(tier2_pct: float = 0.10, comm_cap: float = 10_000_000.0, lives_cap: fl
         f"${product_detail['ExactCommission'].sum():,.0f} of it reported exactly "
         f"({product_detail['ExactCommission'].sum() / _pc.sum() * 100:.1f}%)")
 
+    # ---- Company x product matrix: ONE ROW PER COMPANY, one column per product.
+    # The long detail table only has rows for products a company HOLDS, so a gap
+    # is invisible there - the row simply is not present. Pivoting makes the gap
+    # explicit: a blank cell means that product was never sold to that company.
+    wide_comm = (
+        product_detail.pivot_table(index="Employer", columns="Product",
+                                   values="ProductCommission", aggfunc="sum")
+        .reindex(columns=ALL_PRODUCTS)
+    )
+    wide_comm.columns = [f"Comm_{column_suffix(c)}" for c in wide_comm.columns]
+    wide_lives = (
+        product_detail.pivot_table(index="Employer", columns="Product",
+                                   values="CoveredLives", aggfunc="max")
+        .reindex(columns=ALL_PRODUCTS)
+    )
+
+    # ---- Sizing the gap: what would a missing product be worth on this account?
+    #
+    # Two corrections matter here, and getting either wrong inflates the answer
+    # several times over:
+    #
+    # 1. Benchmark ONLY from single-product contracts. On a bundled contract the
+    #    premium and commission cover every product on it, mostly life and
+    #    disability, so deriving a voluntary rate from bundled rows attributes
+    #    core-line money to the voluntary line. Measured on this file, critical
+    #    illness looks like $43.51 per life on clean contracts against $23.65 from
+    #    bundled ones - and the bundled figure is the WRONG one despite looking
+    #    conservative, because its denominator is the whole group.
+    #
+    # 2. Apply participation. Voluntary products are employee-paid and elective,
+    #    so only part of a group takes them up: measured medians here run from
+    #    0.99 for accident down to 0.11 for long term care. Multiplying a whole
+    #    group's lives by a per-participant rate assumes universal take-up.
+    #
+    # Commission per life is banded by group size because small groups pay
+    # materially more per life; medians throughout so one contract cannot move a
+    # band.
+    BANDS = [(0, 100), (100, 500), (500, 1_000), (1_000, 5_000),
+             (5_000, 20_000), (20_000, float("inf"))]
+
+    def band_of(lives):
+        for i, (lo, hi) in enumerate(BANDS):
+            if lo <= lives < hi:
+                return i
+        return len(BANDS) - 1
+
+    bench_src = product_detail[
+        (product_detail["ExactCommission"] > 0) & (product_detail["CoveredLives"] > 0)
+    ].copy()
+    bench_src["_band"] = bench_src["CoveredLives"].map(band_of)
+    bench_src["_cpl"] = bench_src["ExactCommission"] / bench_src["CoveredLives"]
+
+    # Commission per life falls steeply with group size - accident runs $30.49 for
+    # groups under 100 against $0.61 above 20,000, a 50x spread - so a thin band
+    # must fall back to the NEAREST band, never to the overall median. The overall
+    # median is dominated by small groups, and using it for a large employer
+    # overstates the gap by an order of magnitude.
+    MIN_BENCH_N = 30
+    MIN_HOLDERS_TO_MODEL = 200
+
+    _banded = bench_src.groupby(["Product", "_band"]).agg(cpl=("_cpl", "median"), n=("Employer", "size"))
+    solid = {(p, int(b)): r["cpl"] for (p, b), r in _banded.iterrows() if r["n"] >= MIN_BENCH_N}
+    counts = {(p, int(b)): int(r["n"]) for (p, b), r in _banded.iterrows()}
+
+    def nearest_band_cpl(prod, band):
+        """Walk outward to the closest band that has enough observations."""
+        for dist in range(len(BANDS)):
+            for cand in (band - dist, band + dist):
+                if 0 <= cand < len(BANDS) and (prod, cand) in solid:
+                    return solid[(prod, cand)], (dist == 0)
+        return np.nan, False
+
+    # A product almost nobody buys cannot be benchmarked - Pet and Identity Theft
+    # have a single clean contract each, and extrapolating from one contract made
+    # Pet the "biggest gap" for 47,195 companies in an earlier build.
+    holders = product_detail.groupby("Product")["Employer"].nunique()
+    modellable = {p for p in ALL_PRODUCTS if holders.get(p, 0) >= MIN_HOLDERS_TO_MODEL}
+    _skipped = [p for p in ALL_PRODUCTS if p not in modellable]
+    if _skipped:
+        log(f"opportunity not modelled for {', '.join(_skipped)} "
+            f"(<{MIN_HOLDERS_TO_MODEL} holders - too thin to benchmark)")
+
+    # Participation = this product's covered lives against the group's core lives.
+    core_lives = (
+        product_detail[product_detail["Product"].isin(CORE_PRODUCTS)]
+        .groupby("Employer")["CoveredLives"].max()
+    )
+    participation = {}
+    for prod in ALL_PRODUCTS:
+        sub = (product_detail[product_detail["Product"] == prod]
+               .set_index("Employer")["CoveredLives"])
+        j = pd.concat([sub.rename("p"), core_lives.rename("c")], axis=1).dropna()
+        j = j[(j["c"] > 0) & (j["p"] > 0)]
+        participation[prod] = float((j["p"] / j["c"]).clip(upper=1.0).median()) if len(j) >= 20 else 1.0
+
+    emp_core = employers.set_index("Employer")["CoveredLives"]
+    emp_band = emp_core.map(band_of)
+
+    opp = pd.DataFrame(index=employers["Employer"])
+    _band_exact = pd.DataFrame(index=employers["Employer"])
+    for prod in ALL_PRODUCTS:
+        col = f"Opp_{column_suffix(prod)}"
+        if prod not in modellable:
+            opp[col] = np.nan
+            continue
+        held = wide_comm.get(f"Comm_{column_suffix(prod)}")
+        held = held.reindex(opp.index) if held is not None else pd.Series(index=opp.index, dtype=float)
+        _lookup = {b: nearest_band_cpl(prod, b) for b in range(len(BANDS))}
+        cpl = emp_band.map(lambda b: _lookup[b][0])
+        _band_exact[col] = emp_band.map(lambda b: _lookup[b][1])
+        est = emp_core * participation[prod] * cpl
+        # Only a gap is an opportunity: blank out anything already sold.
+        opp[col] = est.where(held.isna() & (emp_core > 0))
+
+    VB_OPP_COLS = [f"Opp_{column_suffix(p)}" for p in VOLUNTARY_PRODUCTS if p in modellable]
+    opp["VoluntaryOpportunity"] = opp[VB_OPP_COLS].sum(axis=1, min_count=1)
+    opp["TotalOpportunity"] = opp[[c for c in opp.columns if c.startswith("Opp_")]].sum(axis=1, min_count=1)
+    opp["BiggestGap"] = (
+        opp[VB_OPP_COLS].idxmax(axis=1).str.replace("Opp_", "", regex=False)
+        .where(opp[VB_OPP_COLS].notna().any(axis=1))
+    )
+    # Whether the benchmark came from this company's own size band or had to be
+    # borrowed from a neighbouring one. Large employers mostly land on "Indicative"
+    # because few groups above 20,000 lives buy voluntary on a standalone contract.
+    _exact_share = _band_exact[[c for c in VB_OPP_COLS if c in _band_exact.columns]]
+    opp["OpportunityConfidence"] = np.where(
+        _exact_share.mean(axis=1) >= 0.5, "Benchmarked in own size band", "Indicative - borrowed band")
+
+    key_cols = ["Employer", "EIN", "State", "CoveredLives", "PrimaryBroker", "BrokerFamily",
+                "BrokerTier", "TotalCommissions", "TotalPremium"]
+    company_matrix = (
+        employers[key_cols]
+        .merge(wide_comm.reset_index(), on="Employer", how="left")
+        .merge(opp.reset_index(), on="Employer", how="left")
+    )
+    company_matrix["AON_Is_Broker"] = company_matrix["BrokerFamily"].eq("AON")
+    company_matrix["BrokerStatus"] = np.where(
+        company_matrix["AON_Is_Broker"], "AON is broker of record", "NOT AON - opportunity")
+    comm_cols = [f"Comm_{column_suffix(p)}" for p in ALL_PRODUCTS]
+    company_matrix["ProductsHeld"] = company_matrix[comm_cols].notna().sum(axis=1)
+    company_matrix["CommissionTotal"] = company_matrix[comm_cols].sum(axis=1, min_count=1)
+
+    company_matrix = company_matrix[
+        key_cols[:3] + ["BrokerStatus", "PrimaryBroker", "BrokerFamily", "BrokerTier",
+                        "CoveredLives", "ProductsHeld", "CommissionTotal"]
+        + comm_cols
+        + ["VoluntaryOpportunity", "BiggestGap", "OpportunityConfidence", "TotalOpportunity"]
+        + [f"Opp_{column_suffix(p)}" for p in ALL_PRODUCTS]
+        + ["AON_Is_Broker"]
+    ].sort_values("VoluntaryOpportunity", ascending=False)
+
+    log(f"company matrix: {len(company_matrix):,} companies, "
+        f"voluntary opportunity ${company_matrix['VoluntaryOpportunity'].sum():,.0f} "
+        f"(${company_matrix.loc[~company_matrix['AON_Is_Broker'], 'VoluntaryOpportunity'].sum():,.0f} "
+        "on non-AON accounts)")
+
     # ---- Commission by product: the headline "what is each line worth" table.
     commission_by_product = (
         product_detail.groupby(["ProductGroup", "Product"], as_index=False)
@@ -783,6 +942,7 @@ def build(tier2_pct: float = 0.10, comm_cap: float = 10_000_000.0, lives_cap: fl
 
     return {
         "employers": employers,
+        "company_matrix": company_matrix,
         "product_detail": product_detail,
         "commission_by_product": commission_by_product,
         "premium_by_product": premium_by_product,
@@ -883,6 +1043,13 @@ def write_readme(writer, counts: dict, dq: dict, tier2_pct: float, with_detail: 
         ("Employers", f"{counts['employers']:,} rows. One row per employer - the master cleaned table. "
                       "Product coverage, covered lives, premium, premium per life, commissions, commission as a "
                       "percent of premium, primary broker + matched family/tier, geography."),
+        ("Company_Product_Matrix", f"{counts['company_matrix']:,} rows. ONE ROW PER COMPANY, one column per product. "
+                                   "Comm_* holds the commission that product actually earned on that account; a BLANK "
+                                   "means the product was never sold to them. Opp_* is the mirror image - a modelled "
+                                   "estimate of what the gap would be worth, blank where the product is already held. "
+                                   "VoluntaryOpportunity totals the voluntary gaps, BiggestGap names the largest one. "
+                                   "Sort by VoluntaryOpportunity and filter BrokerStatus to 'NOT AON' for the "
+                                   "target list. Opp_* figures are MODELLED, not reported - see Caveats."),
         ("Employer_Product_Detail", f"{counts['product_detail']:,} rows. ONE ROW PER PRODUCT PER EMPLOYER - the "
                                     "line-by-line view. Commission, lives, premium, EIN, incumbent broker and a "
                                     "BrokerStatus column that splits 'AON is broker of record' from "
@@ -1020,6 +1187,19 @@ def write_readme(writer, counts: dict, dq: dict, tier2_pct: float, with_detail: 
         "same reason premium cannot be split by product - see the Premium_By_Product sheet, where "
         "'PremiumOnThoseContracts' figures OVERLAP and must not be added down the column. 'SoleProductPremium' is "
         "the only premium unambiguously attributable to one product.",
+        "THE Opp_* COLUMNS ON Company_Product_Matrix ARE MODELLED, NOT REPORTED. Nothing in Form 5500 says what an "
+        "unsold product would have earned. Each estimate is the company's core covered lives x that product's median "
+        "participation rate x median commission per participating life, benchmarked among companies of similar size "
+        "(six bands, since small groups pay materially more per life; bands under 30 observations fall back to the "
+        "product's overall median). Benchmarks come ONLY from single-product contracts, where the commission is "
+        "unambiguously that product's - deriving them from bundled contracts attributes life and disability money to "
+        "the voluntary line and roughly doubles every figure.",
+        "USE THE Opp_* COLUMNS TO RANK ACCOUNTS, NOT TO FORECAST REVENUE. Summed across all companies they describe "
+        "a fully-saturated market in which every employer buys every product - roughly 6x today's voluntary "
+        "commission - which is a ceiling, not a pipeline. The per-account figures are what matter: a $50k gap and a "
+        "$500 gap are reliably different, and that ordering is the point. Real pricing depends on industry, "
+        "demographics, take-up and plan design, none of which are in this data. Blank where a company reports no "
+        "covered lives, or where the product is already held.",
         "ON THE Employer_Product_Detail SHEET, the money columns are not interchangeable. ProductCommission and "
         "CoveredLives are safe to sum down the column - both are real per product. PremiumOnContracts is real but "
         "OVERLAPS across products on a bundled contract, so it must not be summed for a single employer; "
@@ -1056,6 +1236,13 @@ def export(out_path: Path, tier2_pct: float, with_detail: bool, comm_cap: float,
             money_cols=("TotalCommissions", "PrimaryBrokerCommissions", "TotalPremium", "PremiumPerLife"),
             int_cols=("CoveredLives", "BrokerCount", "CarrierCount", "ContractCount"),
             pct_cols=("CommissionPctOfPremium",),
+        )
+        write_sheet(
+            writer, d["company_matrix"], "Company_Product_Matrix",
+            money_cols=tuple([f"Comm_{column_suffix(p)}" for p in ALL_PRODUCTS]
+                             + [f"Opp_{column_suffix(p)}" for p in ALL_PRODUCTS]
+                             + ["CommissionTotal", "VoluntaryOpportunity", "TotalOpportunity"]),
+            int_cols=("CoveredLives", "ProductsHeld"),
         )
         write_sheet(
             writer, d["product_detail"], "Employer_Product_Detail",

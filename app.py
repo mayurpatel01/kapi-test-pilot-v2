@@ -845,6 +845,40 @@ with tab_product:
         },
     )
 
+    st.markdown("#### Company view — one row per company, one column per product")
+    st.caption("A blank cell means that product was never sold to that company. "
+               "The Company_Product_Matrix sheet in the Excel export adds a modelled "
+               "value for each gap.")
+    wide = (view.pivot_table(index="Employer", columns="Product",
+                             values="Commission", aggfunc="sum")
+                .reindex(columns=[p for p in ALL_PRODUCTS if p in set(view["Product"])]))
+    wide_keys = (view[["Employer", "EIN", "StateNorm", "CoveredLives", "PrimaryBroker",
+                       "BrokerStatus"]]
+                 .drop_duplicates("Employer").set_index("Employer"))
+    wide = wide_keys.join(wide, how="right")
+    wide["Total"] = wide[[c for c in wide.columns if c in ALL_PRODUCTS]].sum(axis=1, min_count=1)
+    wide["Held"] = wide[[c for c in wide.columns if c in ALL_PRODUCTS]].notna().sum(axis=1)
+    wide = wide.sort_values("Total", ascending=False)
+
+    st.dataframe(
+        wide.head(1000).reset_index(), use_container_width=True, hide_index=True,
+        column_config={
+            "StateNorm": st.column_config.TextColumn("State"),
+            "CoveredLives": st.column_config.NumberColumn("Lives", format="%,d"),
+            "Total": st.column_config.NumberColumn("Total comm", format="$%,.0f"),
+            **{p: st.column_config.NumberColumn(p, format="$%,.0f")
+               for p in ALL_PRODUCTS if p in wide.columns},
+        },
+    )
+    st.download_button(
+        "Download company matrix as CSV",
+        data=wide.reset_index().to_csv(index=False).encode("utf-8"),
+        file_name="company_product_matrix.csv",
+        mime="text/csv",
+        key="dl_wide",
+        help="Every filtered company, not just the 1,000 shown.",
+    )
+
     ROW_CAP = 5000
     st.markdown(f"#### Detail rows")
     if len(view) > ROW_CAP:
