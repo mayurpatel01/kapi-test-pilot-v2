@@ -728,10 +728,11 @@ st.divider()
 with tab_product:
     st.subheader("Every product, every employer - one row each")
     st.caption(
-        "Lives are real per product. Premium is real but OVERLAPS where one contract covers several "
-        "products, so do not sum it down the column for a single employer. Commission is an estimate: "
-        "Form 5500 reports commissions at employer/broker grain with no product dimension, so the "
-        "employer total is split by each product's share of premium."
+        "Commission is reported per product: Schedule A Part 1 carries FORM_ID, so every broker "
+        "commission row resolves to one contract and therefore to that contract's products. Where a "
+        "contract lists a single product the figure is exact; where it bundles several the contract "
+        "reports one number and it is split evenly, which the Exact% column makes visible. Lives are "
+        "real per product. Premium overlaps on bundled contracts, so do not sum it for one employer."
     )
 
     @st.cache_data(show_spinner="Building product detail...")
@@ -742,11 +743,19 @@ with tab_product:
                      Carriers=("Carrier", "nunique"),
                      Contracts=("ContractRowID", "nunique"))
         )
+        by_contract = _epc.drop_duplicates(["Employer", "Product", "ContractRowID"])
         prem = (
-            _epc.drop_duplicates(["Employer", "Product", "ContractRowID"])
-                .groupby(["Employer", "Product"], as_index=False)
-                .agg(Premium=("Premium", "sum"))
+            by_contract.groupby(["Employer", "Product"], as_index=False)
+                       .agg(Premium=("Premium", "sum"),
+                            Commission=("ProductCommission", "sum"))
         )
+        exact = (
+            by_contract[by_contract["CommissionIsExact"]]
+            .groupby(["Employer", "Product"], as_index=False)
+            .agg(ExactCommission=("ProductCommission", "sum"))
+        )
+        prem = prem.merge(exact, on=["Employer", "Product"], how="left")
+        prem["ExactCommission"] = prem["ExactCommission"].fillna(0)
         topc = (
             _epc.groupby(["Employer", "Product", "Carrier"], as_index=False)
                 .agg(_l=("Covered_Lives", "max"))
@@ -757,14 +766,11 @@ with tab_product:
         out = (base.merge(prem, on=["Employer", "Product"], how="left")
                    .merge(topc, on=["Employer", "Product"], how="left")
                    .merge(emp_slim, on="Employer", how="left"))
-        out["Premium"] = out["Premium"].fillna(0)
-        out["TotalCommissions"] = out["TotalCommissions"].fillna(0)
+        for c in ["Premium", "Commission", "ExactCommission", "TotalCommissions"]:
+            out[c] = out[c].fillna(0)
 
-        share = out.groupby("Employer")["Premium"].transform("sum")
-        out["EstCommission"] = out["TotalCommissions"] * out["Premium"] / share.replace(0, np.nan)
-        # No premium anywhere means nothing to split the commission across, so the
-        # estimate is blank rather than a misleading zero.
-        out["CommissionAllocatable"] = share > 0
+        out["CommissionExact%"] = out["ExactCommission"] / out["Commission"].replace(0, np.nan) * 100.0
+        out["CommissionRate%"] = out["Commission"] / out["Premium"].replace(0, np.nan) * 100.0
         out["PremiumPerLife"] = out["Premium"] / out["CoveredLives"].replace(0, np.nan)
         out["AON_Is_Broker"] = out["BrokerFamily"].eq("AON")
         out["BrokerStatus"] = np.where(out["AON_Is_Broker"], "AON is broker of record",
@@ -804,36 +810,38 @@ with tab_product:
     if group_pick:
         view = view[view["ProductGroup"].isin(group_pick)]
 
-    view = view.sort_values("Premium", ascending=False)
+    view = view.sort_values("Commission", ascending=False)
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Rows in view", f"{len(view):,}")
     c2.metric("Employers", f"{view['Employer'].nunique():,}")
+    _c = float(view["Commission"].sum())
+    _ex = float(view["ExactCommission"].sum())
+    c3.metric("Commission", f"${_c/1e9:.2f}B" if _c >= 1e9 else f"${_c/1e6:,.1f}M",
+              delta=f"{_ex/_c*100:.0f}% reported exactly" if _c > 0 else None, delta_color="off")
     _p = float(view["Premium"].sum())
-    c3.metric("Premium (overlapping)", f"${_p/1e9:.2f}B" if _p >= 1e9 else f"${_p/1e6:,.0f}M")
-    _ec = float(view["EstCommission"].fillna(0).sum())
-    c4.metric("Est. commission", f"${_ec/1e6:,.1f}M")
-
-    _stuck = view[~view["CommissionAllocatable"]]
-    _stuck_comm = _stuck.drop_duplicates("Employer")["TotalCommissions"].sum()
-    if _stuck_comm > 0:
-        st.caption(
-            f"⚠ {_stuck['Employer'].nunique():,} employers in this view (${_stuck_comm/1e6:,.1f}M of "
-            "commissions) reported no premium, so their commission cannot be split by product. "
-            "The estimate above is short by that amount."
-        )
+    c4.metric("Premium (overlapping)", f"${_p/1e9:.2f}B" if _p >= 1e9 else f"${_p/1e6:,.0f}M",
+              delta=f"{_c/_p*100:.2f}% commission rate" if _p > 0 else None, delta_color="off")
 
     st.markdown("#### By product")
     roll = (view.groupby(["ProductGroup", "Product"], as_index=False)
                 .agg(Employers=("Employer", "nunique"), Lives=("CoveredLives", "sum"),
-                     Premium=("Premium", "sum"), EstCommission=("EstCommission", "sum"))
-                .sort_values("Premium", ascending=False))
+                     Commission=("Commission", "sum"), Exact=("ExactCommission", "sum"),
+                     Premium=("Premium", "sum"))
+                .sort_values("Commission", ascending=False))
+    roll["Exact%"] = roll["Exact"] / roll["Commission"].replace(0, np.nan) * 100.0
+    roll["Rate%"] = roll["Commission"] / roll["Premium"].replace(0, np.nan) * 100.0
     st.dataframe(
-        roll, use_container_width=True, hide_index=True,
+        roll[["ProductGroup", "Product", "Employers", "Lives", "Commission", "Exact%",
+              "Premium", "Rate%"]],
+        use_container_width=True, hide_index=True,
         column_config={
             "Lives": st.column_config.NumberColumn(format="%,d"),
+            "Commission": st.column_config.NumberColumn(format="$%,.0f"),
+            "Exact%": st.column_config.NumberColumn("Exact%", format="%.0f%%",
+                                                    help="Share reported against a single-product contract."),
             "Premium": st.column_config.NumberColumn(format="$%,.0f"),
-            "EstCommission": st.column_config.NumberColumn("Est. commission", format="$%,.0f"),
+            "Rate%": st.column_config.NumberColumn("Comm rate", format="%.2f%%"),
         },
     )
 
@@ -845,17 +853,18 @@ with tab_product:
     st.dataframe(
         view.head(ROW_CAP)[[
             "Employer", "EIN", "StateNorm", "Product", "ProductGroup", "CoveredLives",
-            "Premium", "PremiumPerLife", "EstCommission", "BrokerStatus", "PrimaryBroker",
-            "BrokerFamily", "BrokerTier", "TopCarrier", "TotalCommissions",
+            "Commission", "CommissionExact%", "CommissionRate%", "Premium", "PremiumPerLife",
+            "BrokerStatus", "PrimaryBroker", "BrokerFamily", "BrokerTier", "TopCarrier",
         ]].reset_index(drop=True),
         use_container_width=True, hide_index=True,
         column_config={
             "StateNorm": st.column_config.TextColumn("State"),
             "CoveredLives": st.column_config.NumberColumn("Lives", format="%,d"),
+            "Commission": st.column_config.NumberColumn("Commission", format="$%,.0f"),
+            "CommissionExact%": st.column_config.NumberColumn("Exact%", format="%.0f%%"),
+            "CommissionRate%": st.column_config.NumberColumn("Comm rate", format="%.2f%%"),
             "Premium": st.column_config.NumberColumn(format="$%,.0f"),
             "PremiumPerLife": st.column_config.NumberColumn("Prem/life", format="$%,.0f"),
-            "EstCommission": st.column_config.NumberColumn("Est. comm (product)", format="$%,.0f"),
-            "TotalCommissions": st.column_config.NumberColumn("Employer comm (total)", format="$%,.0f"),
         },
     )
 

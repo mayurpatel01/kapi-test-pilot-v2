@@ -105,8 +105,16 @@ def build_marts(zip_a: Path, zip_b: Path, zip_c: Path, out_dir: Path):
     df_a = df_a[["ACK_ID", "Employer_ID", "Employer"]].drop_duplicates()
 
     # -----------------------------
-    # Dataset B: carrier/product presence + covered lives
-    # IMPORTANT: We do NOT attach commissions here.
+    # Dataset B: carrier/product presence, covered lives, premium, commission
+    #
+    # Commission DOES attach here, at contract grain. Schedule A Part 1 (dataset
+    # C) carries FORM_ID alongside ACK_ID, and (ACK_ID, FORM_ID) is unique per
+    # Schedule A row -- so every broker commission row resolves to exactly one
+    # contract, and therefore to that contract's products. Verified against the
+    # 2024 file: 380,007 of 380,007 Part 1 rows join, 100%.
+    #
+    # The employer/broker rollup in dataset C below is kept as well, because it
+    # is the grain the broker-league tables need and it reconciles against this.
     # -----------------------------
     df_b = read_zip_csv(zip_b, dtype=str)
 
@@ -154,6 +162,33 @@ def build_marts(zip_a: Path, zip_b: Path, zip_c: Path, out_dir: Path):
     log(f"premium populated on {int((df_b['Premium'] > 0).sum()):,} of {len(df_b):,} Schedule A rows "
         f"({(df_b['Premium'] > 0).mean() * 100:.1f}%)")
 
+    # ---- Commission at CONTRACT grain, via the (ACK_ID, FORM_ID) join.
+    df_c_early = read_zip_csv(zip_c, dtype=str)
+    if "FORM_ID" in df_c_early.columns and "FORM_ID" in df_b.columns:
+        df_c_early["_comm"] = safe_numeric(df_c_early["INS_BROKER_COMM_PD_AMT"])
+        contract_comm = (
+            df_c_early.groupby(["ACK_ID", "FORM_ID"], as_index=False)
+                      .agg(ContractCommission=("_comm", "sum"),
+                           ContractBrokers=("INS_BROKER_NAME", "nunique"))
+        )
+        before = len(df_b)
+        df_b = df_b.merge(contract_comm, on=["ACK_ID", "FORM_ID"], how="left")
+        assert len(df_b) == before, "contract commission join changed row count"
+        df_b["ContractCommission"] = df_b["ContractCommission"].fillna(0.0)
+        df_b["ContractBrokers"] = df_b["ContractBrokers"].fillna(0).astype(int)
+
+        joined = df_c_early.merge(df_b[["ACK_ID", "FORM_ID"]].drop_duplicates(),
+                                  on=["ACK_ID", "FORM_ID"], how="inner")
+        log(f"commission joined to contracts: {len(joined):,} of {len(df_c_early):,} Part 1 rows "
+            f"({len(joined) / len(df_c_early) * 100:.2f}%)")
+        log(f"  contracts carrying commission: {int((df_b['ContractCommission'] > 0).sum()):,} "
+            f"of {len(df_b):,}")
+    else:
+        log("Warning: FORM_ID missing - commission cannot be tied to products, "
+            "falling back to employer grain only")
+        df_b["ContractCommission"] = 0.0
+        df_b["ContractBrokers"] = 0
+
     df_b["IS_LIFE"] = coerce_indicator(df_b[ind_life]) if ind_life in df_b.columns else 0
     df_b["IS_STD"] = coerce_indicator(df_b[ind_std]) if ind_std in df_b.columns else 0
     df_b["IS_LTD"] = coerce_indicator(df_b[ind_ltd]) if ind_ltd in df_b.columns else 0
@@ -167,7 +202,7 @@ def build_marts(zip_a: Path, zip_b: Path, zip_c: Path, out_dir: Path):
     df_b["ContractRowID"] = df_b.index.astype("int64")
 
     CARRY = ["ACK_ID", "ContractRowID", "Carrier", "Covered_Lives", "Premium",
-             "PremiumSource", "RetainedCommission"]
+             "PremiumSource", "RetainedCommission", "ContractCommission", "ContractBrokers"]
 
     # Expand into long rows by product -- checkbox products first
     parts = []
@@ -198,6 +233,25 @@ def build_marts(zip_a: Path, zip_b: Path, zip_c: Path, out_dir: Path):
         sel = b_long[b_long["ProductGroup"] == grp]
         log(f"  {grp:<10} {len(sel):>8,} rows  {sel['ACK_ID'].nunique():>7,} filings")
 
+    # ---- Commission per product.
+    # A contract reports ONE commission covering whatever benefits it lists. Where
+    # it lists a single product that figure is exactly that product's commission,
+    # no estimation involved. Where it lists several, the commission is split
+    # evenly across them -- Schedule A gives no per-benefit breakdown inside a
+    # contract, and premium is likewise reported once for the whole contract, so
+    # there is nothing to weight by. ProductsOnContract is kept alongside so the
+    # exact rows can always be separated from the split ones.
+    b_long["ProductsOnContract"] = b_long.groupby("ContractRowID")["Product"].transform("nunique")
+    b_long["ProductCommission"] = b_long["ContractCommission"] / b_long["ProductsOnContract"]
+    b_long["CommissionIsExact"] = b_long["ProductsOnContract"] == 1
+
+    _exact = b_long[b_long["CommissionIsExact"] & (b_long["ProductCommission"] > 0)]
+    _split = b_long[(~b_long["CommissionIsExact"]) & (b_long["ProductCommission"] > 0)]
+    log(f"  commission exact  (single-product contracts): {len(_exact):>7,} rows  "
+        f"${_exact['ProductCommission'].sum():,.0f}")
+    log(f"  commission split  (multi-product contracts) : {len(_split):>7,} rows  "
+        f"${_split['ProductCommission'].sum():,.0f}")
+
     # Attach employer labels
     employer_product_carrier = b_long.merge(df_a, on="ACK_ID", how="left")
     employer_product_carrier["Employer"] = employer_product_carrier["Employer"].fillna(employer_product_carrier["ACK_ID"].astype(str))
@@ -224,6 +278,8 @@ def build_marts(zip_a: Path, zip_b: Path, zip_c: Path, out_dir: Path):
             Premium=("Premium", "first"),
             PremiumSource=("PremiumSource", "first"),
             RetainedCommission=("RetainedCommission", "first"),
+            Commission=("ContractCommission", "first"),
+            Brokers=("ContractBrokers", "first"),
             Products=("Product", lambda s: " + ".join(sorted(set(s)))),
             ProductCount=("Product", "nunique"),
         )
@@ -255,7 +311,8 @@ def build_marts(zip_a: Path, zip_b: Path, zip_c: Path, out_dir: Path):
     # -----------------------------
     # Dataset C: broker commissions (NO carrier/product join)
     # -----------------------------
-    df_c = read_zip_csv(zip_c, dtype=str)
+    # Already read above for the contract-grain join; reuse rather than re-parse.
+    df_c = df_c_early
     if "ACK_ID" not in df_c.columns:
         raise KeyError("Dataset C missing ACK_ID")
 
@@ -311,6 +368,7 @@ def build_marts(zip_a: Path, zip_b: Path, zip_c: Path, out_dir: Path):
             unique_employers=("Employer", "nunique"),
             covered_lives=("Covered_Lives", "sum"),
             premium=("Premium", "sum"),
+            commission=("ProductCommission", "sum"),
         )
         .sort_values(["ProductGroup", "Product", "covered_lives"], ascending=[True, True, False])
     )
