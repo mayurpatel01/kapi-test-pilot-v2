@@ -95,13 +95,18 @@ def normalize_state(x) -> str:
 # =========================================================
 # Build the cleaned dataset
 # =========================================================
-def load_marts():
+def load_marts(plan_year: int | None = None):
     def rd(name):
-        p = DATA_DIR / f"{name}.parquet"
-        if not p.exists():
-            raise FileNotFoundError(f"Missing mart: {p}")
-        log(f"loading {p.name}")
-        return pd.read_parquet(p)
+        # Prefer the year partition; fall back to the flat layout.
+        candidates = []
+        if plan_year is not None:
+            candidates.append(DATA_DIR / str(plan_year) / f"{name}.parquet")
+        candidates.append(DATA_DIR / f"{name}.parquet")
+        for p in candidates:
+            if p.exists():
+                log(f"loading {p.relative_to(DATA_DIR)}")
+                return pd.read_parquet(p)
+        raise FileNotFoundError(f"Missing mart: {candidates[0]}")
 
     epc = rd("employer_product_carrier")
     ebc = rd("employer_broker_commissions")
@@ -123,8 +128,8 @@ def load_marts():
 
 
 def build(tier2_pct: float = 0.10, comm_cap: float = 10_000_000.0, lives_cap: float = 1_500_000.0,
-          premium_cap: float = 500_000_000.0):
-    epc, ebc, gaps, contracts, geo = load_marts()
+          premium_cap: float = 500_000_000.0, plan_year: int | None = None):
+    epc, ebc, gaps, contracts, geo = load_marts(plan_year)
 
     epc["Covered_Lives"] = to_numeric(epc["Covered_Lives"]).fillna(0)
     epc["Premium"] = to_numeric(epc.get("Premium", 0)).fillna(0)
@@ -726,10 +731,14 @@ def build(tier2_pct: float = 0.10, comm_cap: float = 10_000_000.0, lives_cap: fl
     VB_OPP_COLS = [f"Opp_{column_suffix(p)}" for p in VOLUNTARY_PRODUCTS if p in modellable]
     opp["VoluntaryOpportunity"] = opp[VB_OPP_COLS].sum(axis=1, min_count=1)
     opp["TotalOpportunity"] = opp[[c for c in opp.columns if c.startswith("Opp_")]].sum(axis=1, min_count=1)
-    opp["BiggestGap"] = (
-        opp[VB_OPP_COLS].idxmax(axis=1).str.replace("Opp_", "", regex=False)
-        .where(opp[VB_OPP_COLS].notna().any(axis=1))
-    )
+    # idxmax raises on all-NA rows in future pandas, so restrict to rows that
+    # actually have a gap and leave the rest blank.
+    _has_gap = opp[VB_OPP_COLS].notna().any(axis=1)
+    opp["BiggestGap"] = pd.Series(index=opp.index, dtype="object")
+    if _has_gap.any():
+        opp.loc[_has_gap, "BiggestGap"] = (
+            opp.loc[_has_gap, VB_OPP_COLS].idxmax(axis=1).str.replace("Opp_", "", regex=False)
+        )
     # Whether the benchmark came from this company's own size band or had to be
     # borrowed from a neighbouring one. Large employers mostly land on "Indicative"
     # because few groups above 20,000 lives buy voluntary on a standalone contract.
@@ -1031,6 +1040,9 @@ def write_readme(writer, counts: dict, dq: dict, tier2_pct: float, with_detail: 
     ws.write(r, 0, "Generated", bold); ws.write(r, 1, datetime.now().strftime("%Y-%m-%d %H:%M")); r += 1
     ws.write(r, 0, "Source", bold)
     ws.write(r, 1, "DOL Form 5500 + Schedule A (F_5500, F_SCH_A, F_SCH_A_PART1), 2024 'Latest' release", wrap); r += 1
+    if dq.get("plan_year"):
+        ws.write(r, 0, "Plan year exported", bold)
+        ws.write(r, 1, str(dq["plan_year"]), bold); r += 1
     ws.write(r, 0, "Period covered", bold)
     ws.write(r, 1, "PLAN YEAR 2024. 96.2% of filings have a plan year beginning in 2024; the rest are late or "
                    "amended filings for earlier years. These were SUBMITTED to DOL during 2025 (97.9% received "
@@ -1228,8 +1240,10 @@ def write_readme(writer, counts: dict, dq: dict, tier2_pct: float, with_detail: 
 
 
 def export(out_path: Path, tier2_pct: float, with_detail: bool, comm_cap: float, lives_cap: float,
-           premium_cap: float = 500_000_000.0):
-    d, dq = build(tier2_pct=tier2_pct, comm_cap=comm_cap, lives_cap=lives_cap, premium_cap=premium_cap)
+           premium_cap: float = 500_000_000.0, plan_year: int | None = None):
+    d, dq = build(tier2_pct=tier2_pct, comm_cap=comm_cap, lives_cap=lives_cap,
+                  premium_cap=premium_cap, plan_year=plan_year)
+    dq["plan_year"] = plan_year
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     counts = {k: len(v) for k, v in d.items()}
@@ -1361,6 +1375,8 @@ def parse_args():
                    help="Drop employer-broker commission rows above this amount as filer errors (default 10,000,000)")
     p.add_argument("--lives-cap", type=float, default=1_500_000.0,
                    help="Drop employer-carrier rows above this many covered lives as filer errors (default 1,500,000)")
+    p.add_argument("--plan-year", type=int, default=None,
+                   help="Plan year partition to export from data/marts/<year>/ (default: flat layout)")
     p.add_argument("--premium-cap", type=float, default=500_000_000.0,
                    help="Drop contracts with premium above this amount as filer errors (default 500,000,000)")
     return p.parse_args()
@@ -1369,4 +1385,4 @@ def parse_args():
 if __name__ == "__main__":
     a = parse_args()
     export(Path(a.out).expanduser().resolve(), a.tier2_pct, a.with_detail, a.comm_cap, a.lives_cap,
-           a.premium_cap)
+           a.premium_cap, a.plan_year)

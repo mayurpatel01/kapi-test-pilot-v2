@@ -34,19 +34,37 @@ into `data/raw/`:
 | `F_SCH_A_2024_Latest.zip` | products, covered lives, carriers, premium |
 | `F_SCH_A_PART1_2024_Latest.zip` | broker names and commissions |
 
-Then rebuild:
+Put each year's three zips in `data/raw/<year>/`, then build every year at once:
 
 ```bash
-python etl/build_marts.py \
-  --zip_a data/raw/F_5500_2024_Latest.zip \
-  --zip_b data/raw/F_SCH_A_2024_Latest.zip \
-  --zip_c data/raw/F_SCH_A_PART1_2024_Latest.zip \
-  --out_dir data/marts
+python etl/build_all_years.py                  # every year found under data/raw
+python etl/build_all_years.py --years 2023 2024
+python etl/build_all_years.py --skip-build     # just refresh trend_summary
 ```
+
+That writes `data/marts/<plan_year>/` per year plus a small cross-year
+`trend_summary.parquet`. The app loads only the selected year, so memory stays
+bounded as years accumulate. A single year can still be built directly:
+
+```bash
+python etl/build_marts.py --plan-year 2024 \
+  --zip_a data/raw/2024/F_5500_2024_Latest.zip \
+  --zip_b data/raw/2024/F_SCH_A_2024_Latest.zip \
+  --zip_c data/raw/2024/F_SCH_A_PART1_2024_Latest.zip \
+  --out_dir data/marts/2024
+```
+
+`--plan-year` matters: a release is only ~96% the year it is named for, and the
+late/amended tail also appears in its own release, so loading several years
+unfiltered double-counts.
 
 Marts in `data/marts/` **are** committed on purpose: Streamlit Cloud builds from
 the repo and never runs the ETL, so an untracked mart does not exist in the
 deployed app. Commit them after rebuilding.
+
+**Re-download before rebuilding.** DOL keeps adding late and amended filings to
+closed years. A stale 2024 snapshot held 193,986 filings against 216,769 in the
+current release — 10.5% missing, and it understated commissions by 12.8%.
 
 ## Multi-year: what is available, and when
 
@@ -81,10 +99,18 @@ Note also that DOL keeps adding late and amended filings to *closed* years, so
 re-running the ETL on a fresh download will not reproduce existing marts
 exactly. The 2023 file was still receiving filings in July 2026.
 
-### Before building trend views: key on EIN, not name
+### Employers are keyed on EIN
 
-The pipeline currently keys employers on sponsor name as filed. That is not
-safe across years, and measured on 2023 vs 2024:
+Done — the pipeline keys on `SPONS_DFE_EIN`, with `Employer` carrying a
+canonical display name resolved per EIN (the name that company filed most often)
+and disambiguated with the EIN where two companies share a name. `Employer` and
+`EIN` are strictly 1:1, so any groupby on either is correct.
+
+Geo now comes from the filing row too, rather than the previous approach of
+matching on names with `INC`/`LLC`/`CORP` stripped — which merged distinct
+companies. State, city and ZIP coverage went from partial to 99.9%.
+
+Why it mattered, measured on 2023 vs 2024:
 
 - `SPONS_DFE_EIN` is populated on **100%** of filings in both years.
 - EIN carries over better than name — 92.6% against 90.6%.
@@ -95,9 +121,27 @@ safe across years, and measured on 2023 vs 2024:
 - 1,719 names map to more than one EIN *within a single year*, so a name is not
   a unique key even before any trend work.
 
-The good news: schema is stable across 2023/2024/2025 — every column the ETL
-depends on is present in all three — and the `(ACK_ID, FORM_ID)` commission join
-holds at 100% in every year, so per-product commission works throughout.
+Schema is stable across 2023/2024/2025 — every column the ETL depends on is
+present in all three — and the `(ACK_ID, FORM_ID)` commission join holds at 100%
+in every year, so per-product commission works throughout.
+
+### What the trend actually shows
+
+Comparing the two complete years, voluntary is growing while core is flat:
+
+| Product | 2023 | 2024 | Change |
+|---|---:|---:|---:|
+| Hospital Indemnity | 11,044 | 14,235 | **+28.9%** |
+| Critical Illness | 20,394 | 23,201 | +13.8% |
+| Legal | 4,519 | 5,055 | +11.9% |
+| Accident | 23,169 | 25,826 | +11.5% |
+| Long Term Care | 1,514 | 1,487 | −1.8% |
+| Cancer | 3,145 | 3,065 | −2.5% |
+| *Life (core)* | *58,764* | *58,346* | *−0.7%* |
+| *LTD (core)* | *49,052* | *48,966* | *−0.2%* |
+
+Employers holding each product, counted as distinct EINs so a renamed company
+is not double counted.
 
 ## Excel export
 

@@ -71,7 +71,7 @@ def pick_first_existing_column(df: pd.DataFrame, candidates: list[str]) -> str |
     return None
 
 
-def build_marts(zip_a: Path, zip_b: Path, zip_c: Path, out_dir: Path):
+def build_marts(zip_a: Path, zip_b: Path, zip_c: Path, out_dir: Path, plan_year: int | None = None):
     ensure_dir(out_dir)
 
     # -----------------------------
@@ -79,30 +79,127 @@ def build_marts(zip_a: Path, zip_b: Path, zip_c: Path, out_dir: Path):
     # -----------------------------
     df_a = read_zip_csv(zip_a, dtype=str)
 
-    employer_name_col = pick_first_existing_column(
-        df_a,
-        ["SPONSOR_DFE_NAME", "SPONSOR_NAME", "EMPLOYER_NAME", "PLAN_NAME", "SPONS_DFE_PN"],
-    )
-    employer_id_col = pick_first_existing_column(
-        df_a,
-        ["SPONS_DFE_PN", "SPONSOR_DFE_EIN", "EIN"],
-    )
-
     if "ACK_ID" not in df_a.columns:
         raise KeyError("Dataset A missing ACK_ID")
 
+    employer_name_col = pick_first_existing_column(
+        df_a, ["SPONSOR_DFE_NAME", "SPONSOR_NAME", "EMPLOYER_NAME", "PLAN_NAME"])
     if employer_name_col is None:
         employer_name_col = "ACK_ID"
         log("Warning: employer name column not found in A; using ACK_ID as Employer label.")
 
-    cols_a_keep = ["ACK_ID", employer_name_col]
-    if employer_id_col and employer_id_col in df_a.columns:
-        cols_a_keep.append(employer_id_col)
+    # ---- Employer identity is EIN, not the filed name.
+    #
+    # A sponsor name is neither stable nor unique. Measured on 2023 vs 2024,
+    # 7,291 companies (5.9% of those filing both years) changed their filed name
+    # -- "TERUMO BCT" to "TERUMO BLOOD AND CELL TECHNOLOGIES INC" -- so a
+    # name-keyed trend reads each of those as a lost account. In the other
+    # direction 1,719 names map to more than one EIN inside a single year, so
+    # name-keying silently merges distinct companies even without any trend work.
+    # SPONS_DFE_EIN is populated on 100% of filings in every year checked.
+    ein_col = pick_first_existing_column(df_a, ["SPONS_DFE_EIN", "SPONSOR_DFE_EIN", "EIN"])
+    if ein_col is None:
+        raise KeyError("Dataset A has no EIN column - cannot key employers reliably")
 
-    df_a = df_a[cols_a_keep].copy()
-    df_a["Employer"] = df_a[employer_name_col].astype(str)
-    df_a["Employer_ID"] = df_a[employer_id_col].astype(str) if employer_id_col and employer_id_col in df_a.columns else df_a["ACK_ID"].astype(str)
-    df_a = df_a[["ACK_ID", "Employer_ID", "Employer"]].drop_duplicates()
+    geo_cols = {
+        "State": pick_first_existing_column(df_a, ["SPONS_DFE_MAIL_US_STATE", "SPONS_DFE_LOC_US_STATE"]),
+        "City": pick_first_existing_column(df_a, ["SPONS_DFE_MAIL_US_CITY", "SPONS_DFE_LOC_US_CITY"]),
+        "ZIP": pick_first_existing_column(df_a, ["SPONS_DFE_MAIL_US_ZIP", "SPONS_DFE_LOC_US_ZIP"]),
+    }
+    py_col = pick_first_existing_column(df_a, ["FORM_PLAN_YEAR_BEGIN_DATE", "FORM_TAX_PRD"])
+
+    keep = ["ACK_ID", employer_name_col, ein_col] + [c for c in geo_cols.values() if c]
+    if py_col:
+        keep.append(py_col)
+    df_a = df_a[[c for c in dict.fromkeys(keep)]].copy()
+
+    df_a["EIN"] = (
+        df_a[ein_col].fillna("").astype(str).str.replace(r"\D", "", regex=True)
+        .str.zfill(9).str[-9:]
+    )
+    df_a["NameAsFiled"] = df_a[employer_name_col].fillna("").astype(str).str.strip()
+    bad_ein = df_a["EIN"].isin({"000000000", ""})
+    if bad_ein.any():
+        log(f"Warning: {int(bad_ein.sum()):,} filings have no usable EIN - keyed on name instead")
+    df_a.loc[bad_ein, "EIN"] = "NAME:" + df_a.loc[bad_ein, "NameAsFiled"]
+
+    if py_col:
+        df_a["PlanYear"] = pd.to_datetime(df_a[py_col], errors="coerce").dt.year
+        dom = df_a["PlanYear"].value_counts()
+        if len(dom):
+            log(f"plan year: {int(dom.idxmax())} on {dom.max() / len(df_a) * 100:.1f}% of filings")
+    else:
+        df_a["PlanYear"] = pd.NA
+
+    # A DOL release is ~96% the plan year it is named for, with a tail of late and
+    # amended filings for earlier years reaching back to the 1980s. Those stragglers
+    # also appear in their OWN release, so loading several years without filtering
+    # would double-count them. Restricting each release to its own plan year gives
+    # clean, non-overlapping slices.
+    if plan_year is not None:
+        before = len(df_a)
+        df_a = df_a[df_a["PlanYear"] == plan_year].copy()
+        log(f"filtered to plan year {plan_year}: {len(df_a):,} of {before:,} filings "
+            f"({len(df_a) / before * 100:.1f}%) - stragglers from other plan years dropped")
+        if not len(df_a):
+            raise ValueError(f"No filings for plan year {plan_year} in this release")
+
+    # Canonical display name per EIN: the name that company filed most often,
+    # longest name breaking ties so "TERUMO BLOOD AND CELL TECHNOLOGIES INC" wins
+    # over the abbreviation rather than by accident of ordering.
+    name_counts = (
+        df_a[df_a["NameAsFiled"] != ""]
+        .groupby(["EIN", "NameAsFiled"]).size().rename("n").reset_index()
+    )
+    name_counts["_len"] = name_counts["NameAsFiled"].str.len()
+    canonical = (
+        name_counts.sort_values(["EIN", "n", "_len"], ascending=[True, False, False])
+                   .drop_duplicates("EIN").set_index("EIN")["NameAsFiled"]
+    )
+
+    # A canonical name shared by several EINs would still collide under any
+    # groupby on the label, so those get the EIN appended and stay distinct.
+    shared = canonical.value_counts()
+    shared = set(shared[shared > 1].index)
+    disambiguated = canonical.copy()
+    mask = canonical.isin(shared)
+    disambiguated[mask] = canonical[mask] + " [EIN " + canonical[mask].index.to_series() + "]"
+    if mask.any():
+        log(f"disambiguated {int(mask.sum()):,} employer names shared by multiple EINs")
+
+    df_a["Employer"] = df_a["EIN"].map(disambiguated).fillna(df_a["NameAsFiled"])
+    df_a["Employer_ID"] = df_a["EIN"]
+
+    for out_name, src in geo_cols.items():
+        df_a[out_name] = df_a[src].fillna("").astype(str).str.strip() if src else ""
+    df_a["State"] = df_a["State"].str.upper()
+    df_a["ZIP"] = df_a["ZIP"].str.replace(r"\D", "", regex=True).str[:5]
+
+    # Employer dimension, one row per EIN. Geo comes from the filing itself, so no
+    # name matching is involved -- the previous build inferred it by stripping
+    # INC/LLC/CORP from names, which merged distinct companies.
+    employer_dim = (
+        df_a.sort_values("ACK_ID")
+            .groupby("EIN", as_index=False)
+            .agg(Employer=("Employer", "first"), NameAsFiled=("NameAsFiled", "last"),
+                 State=("State", "first"), City=("City", "first"), ZIP=("ZIP", "first"),
+                 PlanYear=("PlanYear", "first"), Filings=("ACK_ID", "nunique"))
+    )
+    log(f"employer dimension: {len(employer_dim):,} distinct EINs "
+        f"from {df_a['ACK_ID'].nunique():,} filings")
+
+    out_dim = out_dir / "employer_dim.parquet"
+    log(f"Writing {out_dim}")
+    employer_dim.to_parquet(out_dim, index=False)
+
+    # employer_geo keeps its old shape so the dashboard's optional load still
+    # works, but is now derived from the filing rather than name-matched.
+    out_geo = out_dir / "employer_geo.parquet"
+    log(f"Writing {out_geo} (state on "
+        f"{(employer_dim['State'].fillna('') != '').mean() * 100:.1f}% of employers)")
+    employer_dim[["Employer", "State", "ZIP", "City", "EIN"]].to_parquet(out_geo, index=False)
+
+    df_a = df_a[["ACK_ID", "EIN", "Employer_ID", "Employer", "PlanYear"]].drop_duplicates()
 
     # -----------------------------
     # Dataset B: carrier/product presence, covered lives, premium, commission
@@ -385,6 +482,10 @@ def parse_args():
     p.add_argument("--zip_b", required=True, help="Path to Dataset B ZIP (F_SCH_A_2024_Latest.zip)")
     p.add_argument("--zip_c", required=True, help="Path to Dataset C ZIP (F_SCH_A_PART1_2024_Latest.zip)")
     p.add_argument("--out_dir", default="data/marts", help="Output directory for Parquet marts (default: data/marts)")
+    p.add_argument("--plan-year", type=int, default=None,
+                   help="Restrict to this plan year. A DOL release is ~96%% the year it is named for; "
+                        "without this the late/amended tail from other years is kept, which "
+                        "double-counts when several releases are loaded together.")
     return p.parse_args()
 
 
@@ -401,4 +502,4 @@ if __name__ == "__main__":
             log(f"ERROR: File not found: {z}")
             sys.exit(1)
 
-    build_marts(zip_a, zip_b, zip_c, out_dir)
+    build_marts(zip_a, zip_b, zip_c, out_dir, plan_year=args.plan_year)

@@ -45,8 +45,9 @@ st.set_page_config(
 
 st.title("Voluntary Benefits Intelligence Insights (Form 5500)")
 st.caption(
-    "Plan year 2024 (filed with DOL during 2025) — the most recent complete year of Form 5500 filings. "
-    "AON vs competitors decision engine: market share, whitespace, robust diagnostics, and target scoring."
+    "AON vs competitors decision engine: market share, whitespace, robust diagnostics, target scoring "
+    "and per-product commissions from DOL Form 5500. Pick a plan year in the sidebar — DOL names each "
+    "release for the plan year, and filings arrive over roughly the following two years."
 )
 
 DATA_DIR = Path("data/marts")
@@ -126,7 +127,31 @@ def ensure_mart_exists(filename: str) -> None:
 
 
 @st.cache_data(show_spinner=False)
-def load_parquet(filename: str) -> pd.DataFrame:
+def available_years() -> list:
+    """Plan years with a built mart, newest first. Empty means the older
+    single-directory layout is in use."""
+    if not DATA_DIR.exists():
+        return []
+    years = []
+    for p in DATA_DIR.iterdir():
+        if p.is_dir() and p.name.isdigit() and (p / "employer_product_carrier.parquet").exists():
+            years.append(int(p.name))
+    return sorted(years, reverse=True)
+
+
+@st.cache_data(show_spinner=False)
+def load_parquet(filename: str, year: int | None = None) -> pd.DataFrame:
+    """Load a mart, from the year partition when one is selected."""
+    if year is not None:
+        path = DATA_DIR / str(year) / filename
+        if path.exists():
+            return pd.read_parquet(path)
+        # employer_geo and other shared marts may only exist at the root.
+        root = DATA_DIR / filename
+        if root.exists():
+            return pd.read_parquet(root)
+        raise FileNotFoundError(f"Missing mart: {path}")
+
     ensure_mart_exists(filename)
     path = DATA_DIR / filename
     if not path.exists():
@@ -182,21 +207,61 @@ def normalize_state(x: str) -> str:
 # =========================
 # Load marts
 # =========================
+# ---- Plan year selection.
+# Marts are partitioned by plan year so only the year being viewed is held in
+# memory. A DOL release is filed over about two years, so the most recent year
+# present is normally still accumulating and must not be compared to a complete
+# one -- the default lands on the newest COMPLETE year rather than the newest.
+YEARS = available_years()
+SELECTED_YEAR = None
+INCOMPLETE_YEARS = set()
+
+if YEARS:
+    try:
+        _trend = load_parquet("trend_summary.parquet")
+        _emp_by_year = _trend.groupby("PlanYear")["TotalEmployers"].first()
+        _peak = _emp_by_year.max()
+        # Under 70% of the largest year means the filing cycle is still open.
+        INCOMPLETE_YEARS = set(_emp_by_year[_emp_by_year < _peak * 0.7].index.astype(int))
+    except FileNotFoundError:
+        _trend = None
+
+    _complete = [y for y in YEARS if y not in INCOMPLETE_YEARS]
+    _default = _complete[0] if _complete else YEARS[0]
+
+    with st.sidebar:
+        st.markdown("## Plan year")
+        SELECTED_YEAR = st.selectbox(
+            "Plan year",
+            options=YEARS,
+            index=YEARS.index(_default),
+            format_func=lambda y: f"{y}  (partial)" if y in INCOMPLETE_YEARS else str(y),
+            help="DOL names each release for the plan year, not the filing year. "
+                 "Filings arrive over roughly two years, so the newest year is "
+                 "incomplete until its October extension deadline has passed.",
+        )
+        if SELECTED_YEAR in INCOMPLETE_YEARS:
+            st.warning(
+                f"Plan year {SELECTED_YEAR} is still being filed. Large, complex plans "
+                "take extensions, so what is here under-represents big employers. "
+                "Do not compare it to a complete year."
+            )
+
 with st.spinner("Loading data marts..."):
-    epc = ensure_str(load_parquet("employer_product_carrier.parquet"))
-    ebc = ensure_str(load_parquet("employer_broker_commissions.parquet"))
-    gaps = ensure_str(load_parquet("employer_product_matrix.parquet"))
+    epc = ensure_str(load_parquet("employer_product_carrier.parquet", SELECTED_YEAR))
+    ebc = ensure_str(load_parquet("employer_broker_commissions.parquet", SELECTED_YEAR))
+    gaps = ensure_str(load_parquet("employer_product_matrix.parquet", SELECTED_YEAR))
 
     # Contract-level mart. Premium MUST be summed from here rather than from epc:
     # a contract covering life + STD + LTD appears three times in the product view
     # and carries one premium, so summing there inflates it ~2.5x.
     try:
-        contracts = ensure_str(load_parquet("employer_contract.parquet"))
+        contracts = ensure_str(load_parquet("employer_contract.parquet", SELECTED_YEAR))
     except FileNotFoundError:
         contracts = pd.DataFrame(columns=["ContractRowID", "Employer", "Carrier", "Premium"])
 
     try:
-        geo = ensure_str(load_parquet("employer_geo.parquet"))
+        geo = ensure_str(load_parquet("employer_geo.parquet", SELECTED_YEAR))
     except FileNotFoundError:
         geo = pd.DataFrame(columns=["Employer", "State", "City", "ZIP", "EIN"])
 
@@ -706,10 +771,11 @@ st.divider()
 # =========================
 # Tabs
 # =========================
-(tab_product, tab_overview, tab_comp, tab_whitespace, tab_scoring,
+(tab_product, tab_trend, tab_overview, tab_comp, tab_whitespace, tab_scoring,
  tab_diag, tab_report, tab_ai, tab_raw) = st.tabs(
     [
         "Product Detail",
+        "Trends",
         "Market Overview",
         "Competitive Share",
         "Product Whitespace",
@@ -909,6 +975,76 @@ with tab_product:
         mime="text/csv",
         help="Downloads every filtered row, not just the ones displayed above.",
     )
+
+
+# =========================
+# Trends across plan years
+# =========================
+with tab_trend:
+    st.subheader("Product trends across plan years")
+    try:
+        trend = load_parquet("trend_summary.parquet")
+    except FileNotFoundError:
+        trend = None
+
+    if trend is None or not len(trend):
+        st.info("No trend summary yet. Build one with:  python etl/build_all_years.py")
+    else:
+        partial = sorted(INCOMPLETE_YEARS)
+        if partial:
+            st.warning(
+                f"Plan year{'s' if len(partial) > 1 else ''} {', '.join(map(str, partial))} "
+                "still being filed and excluded from the charts below. Large plans take "
+                "extensions, so including a partial year shows a decline that is an artefact "
+                "of the filing calendar rather than the market."
+            )
+        full = trend[~trend["PlanYear"].isin(INCOMPLETE_YEARS)].copy()
+
+        if full["PlanYear"].nunique() < 2:
+            st.info("At least two complete plan years are needed for a trend. "
+                    "Build more with:  python etl/build_all_years.py")
+        else:
+            group = st.radio("Product group", ["Voluntary", "Core", "Adjacent"],
+                             index=0, horizontal=True)
+            sel = full[full["ProductGroup"] == group]
+
+            metric = st.radio("Metric", ["Employers holding", "Commission", "Premium"],
+                              index=0, horizontal=True)
+            col = {"Employers holding": "Employers", "Commission": "Commission",
+                   "Premium": "Premium"}[metric]
+
+            fig = px.line(sel.sort_values("PlanYear"), x="PlanYear", y=col, color="Product",
+                          markers=True)
+            fig.update_layout(xaxis_title=None,
+                              xaxis=dict(tickmode="array",
+                                         tickvals=sorted(sel["PlanYear"].unique())))
+            st.plotly_chart(fig, use_container_width=True)
+
+            st.markdown("#### Year on year")
+            years_sorted = sorted(sel["PlanYear"].unique())
+            first, last = years_sorted[0], years_sorted[-1]
+            piv = sel.pivot_table(index="Product", columns="PlanYear", values=col, aggfunc="sum")
+            if first in piv.columns and last in piv.columns:
+                piv["Change"] = piv[last] - piv[first]
+                piv["Change%"] = (piv[last] / piv[first].replace(0, np.nan) - 1) * 100
+            money = col in ("Commission", "Premium")
+            st.dataframe(
+                piv.reset_index().sort_values("Change%", ascending=False),
+                use_container_width=True, hide_index=True,
+                column_config={
+                    **{str(y): st.column_config.NumberColumn(
+                        str(y), format="$%,.0f" if money else "%,d") for y in years_sorted},
+                    **{y: st.column_config.NumberColumn(
+                        str(y), format="$%,.0f" if money else "%,d") for y in years_sorted},
+                    "Change": st.column_config.NumberColumn(
+                        f"{first}->{last}", format="$%,.0f" if money else "%,d"),
+                    "Change%": st.column_config.NumberColumn("Change %", format="%.1f%%"),
+                },
+            )
+            st.caption(
+                f"Comparing complete plan years {first} and {last}. Employer counts are "
+                "distinct EINs, so a company that changed its filed name is still counted once."
+            )
 
 
 # =========================
