@@ -133,6 +133,12 @@ def build(tier2_pct: float = 0.10, comm_cap: float = 10_000_000.0, lives_cap: fl
 
     epc["Covered_Lives"] = to_numeric(epc["Covered_Lives"]).fillna(0)
     epc["Premium"] = to_numeric(epc.get("Premium", 0)).fillna(0)
+    # Contract premium divided across the products on that contract, so it can be
+    # summed down a column. Raw Premium repeats the whole contract figure on each
+    # product row and inflates ~2.4x when added up.
+    if "ProductPremium" not in epc.columns:
+        epc["ProductPremium"] = epc["Premium"] / epc.get("ProductsOnContract", 1)
+    epc["ProductPremium"] = to_numeric(epc["ProductPremium"]).fillna(0)
     ebc["total_commissions"] = to_numeric(ebc["total_commissions"]).fillna(0)
     contracts["Premium"] = to_numeric(contracts["Premium"]).fillna(0)
 
@@ -533,7 +539,8 @@ def build(tier2_pct: float = 0.10, comm_cap: float = 10_000_000.0, lives_cap: fl
     prod_premium = (
         epc.drop_duplicates(["Employer", "Product", "ContractRowID"])
            .groupby(["Employer", "Product"], as_index=False)
-           .agg(PremiumOnContracts=("Premium", "sum"))
+           .agg(PremiumOnContracts=("Premium", "sum"),
+                ProductPremium=("ProductPremium", "sum"))
     )
     sole_ids = set(contracts.loc[contracts["ProductCount"] == 1, "ContractRowID"])
     prod_sole = (
@@ -564,8 +571,8 @@ def build(tier2_pct: float = 0.10, comm_cap: float = 10_000_000.0, lives_cap: fl
             "CoveredLives": "EmployerCoveredLives",
         }), on="Employer", how="left")
     )
-    for c in ["PremiumOnContracts", "SoleProductPremium", "EmployerCommissions",
-              "ProductCommission", "ExactCommission"]:
+    for c in ["PremiumOnContracts", "ProductPremium", "SoleProductPremium",
+              "EmployerCommissions", "ProductCommission", "ExactCommission"]:
         product_detail[c] = product_detail[c].fillna(0)
 
     product_detail["ProductPremiumShare%"] = (
@@ -601,7 +608,8 @@ def build(tier2_pct: float = 0.10, comm_cap: float = 10_000_000.0, lives_cap: fl
         "Employer", "EIN", "State", "City",
         "Product", "ProductGroup",
         "CoveredLives", "ProductCommission", "ExactCommission", "CommissionExact%",
-        "PremiumOnContracts", "PremiumPerLife", "SoleProductPremium", "ProductPremiumShare%",
+        "ProductPremium", "PremiumOnContracts", "PremiumPerLife", "SoleProductPremium",
+        "ProductPremiumShare%",
         "BrokerStatus", "AON_Is_Broker", "PrimaryBroker", "BrokerFamily", "BrokerTier",
         "EmployerCommissions", "EmployerPremium", "EmployerCoveredLives",
         "TopCarrier", "Carriers", "Contracts",
@@ -782,7 +790,8 @@ def build(tier2_pct: float = 0.10, comm_cap: float = 10_000_000.0, lives_cap: fl
              Contracts=("Contracts", "sum"),
              Commission=("ProductCommission", "sum"),
              ExactCommission=("ExactCommission", "sum"),
-             Premium=("PremiumOnContracts", "sum"))
+             Premium=("ProductPremium", "sum"),
+             PremiumOnContracts=("PremiumOnContracts", "sum"))
     )
     commission_by_product["SplitCommission"] = (
         commission_by_product["Commission"] - commission_by_product["ExactCommission"]
@@ -1220,11 +1229,13 @@ def write_readme(writer, counts: dict, dq: dict, tier2_pct: float, with_detail: 
         "demographics, take-up and plan design, none of which are in this data. Blank where a company reports no "
         "covered lives, or where the product is already held.",
         "ON THE Employer_Product_Detail SHEET, the money columns are not interchangeable. ProductCommission and "
-        "CoveredLives are safe to sum down the column - both are real per product. PremiumOnContracts is real but "
-        "OVERLAPS across products on a bundled contract, so it must not be summed for a single employer; "
+        "ProductPremium are SAFE TO SUM - both are the contract figure divided across the products on that "
+        "contract. PremiumOnContracts is the whole contract's premium repeated on each of its product rows: use it "
+        "to answer 'what is this contract worth', never add it up. On a six-product contract the two differ by 6x. "
         "SoleProductPremium is the unambiguous single-product figure. EmployerCommissions and EmployerPremium are "
         "employer TOTALS repeated on every one of that employer's rows - summing either multiplies by the product "
-        "count. They are there for reconciliation, not aggregation.",
+        "count. They are there for reconciliation, not aggregation. CoveredLives is real per product but must not "
+        "be summed across products for one employer, since the same people are covered by each benefit.",
         "Premium is a coalesce of two Schedule A fields: WLFR_PREMIUM_RCVD_AMT (the experience-rated section, ~7% "
         "populated) falling back to WLFR_TOT_CHARGES_PAID_AMT ('total charges paid for this contract', ~78% "
         "populated). Together they cover ~84% of Schedule A rows. Employers with no premium figure are not "
@@ -1267,15 +1278,16 @@ def export(out_path: Path, tier2_pct: float, with_detail: bool, comm_cap: float,
         )
         write_sheet(
             writer, d["product_detail"], "Employer_Product_Detail",
-            money_cols=("ProductCommission", "ExactCommission", "PremiumOnContracts",
-                        "PremiumPerLife", "SoleProductPremium", "EmployerCommissions",
-                        "EmployerPremium"),
+            money_cols=("ProductCommission", "ExactCommission", "ProductPremium",
+                        "PremiumOnContracts", "PremiumPerLife", "SoleProductPremium",
+                        "EmployerCommissions", "EmployerPremium"),
             int_cols=("CoveredLives", "EmployerCoveredLives", "Carriers", "Contracts"),
             pct_cols=("ProductPremiumShare%", "CommissionExact%"),
         )
         write_sheet(
             writer, d["commission_by_product"], "Commission_By_Product",
-            money_cols=("Commission", "ExactCommission", "SplitCommission", "Premium"),
+            money_cols=("Commission", "ExactCommission", "SplitCommission", "Premium",
+                        "PremiumOnContracts"),
             int_cols=("Employers", "CoveredLives", "Contracts"),
             pct_cols=("Exact%", "CommissionRate%"),
         )

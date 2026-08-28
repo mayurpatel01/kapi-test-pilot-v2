@@ -62,10 +62,12 @@ def build_trend_summary(years):
         epc = epc[epc["Covered_Lives"] <= 1_500_000]
         epc.loc[epc["ContractCommission"] > 10_000_000, "ProductCommission"] = 0.0
         by_contract = epc.drop_duplicates(["Employer", "Product", "ContractRowID"])
+        # ProductPremium, not Premium: the raw column repeats the whole contract's
+        # premium on each of its product rows, so summing it inflates ~2.4x.
         g = (by_contract.groupby(["Product", "ProductGroup"], as_index=False)
              .agg(Employers=("EIN", "nunique"),
                   Commission=("ProductCommission", "sum"),
-                  Premium=("Premium", "sum")))
+                  Premium=("ProductPremium", "sum")))
         lives = (epc.groupby(["Product", "ProductGroup", "EIN"])["Covered_Lives"].max()
                  .groupby(level=[0, 1]).sum().rename("CoveredLives").reset_index())
         g = g.merge(lives, on=["Product", "ProductGroup"], how="left")

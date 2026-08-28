@@ -342,6 +342,20 @@ def build_marts(zip_a: Path, zip_b: Path, zip_c: Path, out_dir: Path, plan_year:
     b_long["ProductCommission"] = b_long["ContractCommission"] / b_long["ProductsOnContract"]
     b_long["CommissionIsExact"] = b_long["ProductsOnContract"] == 1
 
+    # Premium gets the same treatment, and for the same reason. A contract
+    # reports ONE premium covering every benefit on it, so the raw Premium column
+    # repeats on each of that contract's product rows -- six identical values for
+    # a six-product contract, which sums to 6x the money actually filed.
+    # ProductPremium divides it, so it is safe to add down a column; Premium is
+    # kept as-is for "what is this whole contract worth" questions.
+    b_long["ProductPremium"] = b_long["Premium"] / b_long["ProductsOnContract"]
+    b_long["PremiumIsExact"] = b_long["ProductsOnContract"] == 1
+
+    _dup = b_long[b_long["ProductsOnContract"] > 1]
+    log(f"  premium split across {_dup['ContractRowID'].nunique():,} multi-product contracts "
+        f"(raw Premium would sum to ${b_long['Premium'].sum():,.0f} against a true "
+        f"${b_long['ProductPremium'].sum():,.0f})")
+
     _exact = b_long[b_long["CommissionIsExact"] & (b_long["ProductCommission"] > 0)]
     _split = b_long[(~b_long["CommissionIsExact"]) & (b_long["ProductCommission"] > 0)]
     log(f"  commission exact  (single-product contracts): {len(_exact):>7,} rows  "
@@ -473,7 +487,7 @@ def build_marts(zip_a: Path, zip_b: Path, zip_c: Path, out_dir: Path, plan_year:
     log(f"Writing {out_carrier_sum}")
     carrier_summary.to_parquet(out_carrier_sum, index=False)
 
-    log("✅ Done. New marts created (commissions separated to avoid overcount).")
+    log("Done. New marts created (commissions separated to avoid overcount).")
 
 
 def parse_args():

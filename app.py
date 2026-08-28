@@ -287,6 +287,16 @@ if missing:
 # =========================
 epc["Covered_Lives"] = to_numeric(epc["Covered_Lives"]).fillna(0)
 epc["Premium"] = to_numeric(epc["Premium"]).fillna(0) if "Premium" in epc.columns else 0.0
+# ProductPremium is the contract premium divided across the products on that
+# contract, so it can be summed. Premium repeats the whole contract's figure on
+# every product row. Older marts lack it, so fall back rather than KeyError.
+if "ProductPremium" not in epc.columns:
+    epc["ProductPremium"] = epc["Premium"] / epc.get("ProductsOnContract", 1)
+epc["ProductPremium"] = to_numeric(epc["ProductPremium"]).fillna(0)
+for _c in ("ProductCommission", "ContractCommission"):
+    epc[_c] = to_numeric(epc[_c]).fillna(0) if _c in epc.columns else 0.0
+if "CommissionIsExact" not in epc.columns:
+    epc["CommissionIsExact"] = False
 ebc["total_commissions"] = to_numeric(ebc["total_commissions"]).fillna(0)
 if len(contracts) and "Premium" in contracts.columns:
     contracts["Premium"] = to_numeric(contracts["Premium"]).fillna(0)
@@ -305,20 +315,72 @@ LIVES_CAP = 1_500_000.0
 PREMIUM_CAP = 500_000_000.0
 
 _comm_raw = float(ebc["total_commissions"].sum())
+_lives_raw_max = float(epc["Covered_Lives"].max()) if len(epc) else 0.0
+_prem_raw = float(contracts["Premium"].sum()) if len(contracts) else 0.0
+
+# Keep the excluded rows rather than just counting them - the Data Quality tab
+# lists every one with its reported value, so nothing disappears silently.
+DQ_ROWS = []
+
+
+def _flag(df, field, value_col, cap, counterparty=None, reason=None):
+    bad = df[df[value_col] > cap]
+    if not len(bad):
+        return
+    out = pd.DataFrame({
+        "Employer": bad.get("Employer", pd.Series(index=bad.index, dtype=object)),
+        "EIN": bad.get("EIN", pd.Series(index=bad.index, dtype=object)),
+        "Field": field,
+        "Counterparty": counterparty(bad) if counterparty else "",
+        "ReportedValue": bad[value_col],
+        "Cap": cap,
+        "Reason": reason or f"Above the plausibility cap of {cap:,.0f}",
+    })
+    DQ_ROWS.append(out)
+
+
+_flag(ebc, "Commissions paid", "total_commissions", COMM_CAP,
+      counterparty=lambda d: d["Broker"],
+      reason=f"Employer-broker commission above ${COMM_CAP:,.0f}. Form 5500 is self-reported "
+             "and a single keying error here swamps every total in the app.")
+_flag(epc, "Covered lives", "Covered_Lives", LIVES_CAP,
+      counterparty=lambda d: d["Carrier"] + " (" + d["Product"] + ")",
+      reason=f"More than {LIVES_CAP:,.0f} covered lives on one employer-carrier row.")
+if len(contracts):
+    _flag(contracts, "Premium", "Premium", PREMIUM_CAP,
+          counterparty=lambda d: d["Carrier"] + " (" + d.get("Products", "") + ")",
+          reason=f"Single contract premium above ${PREMIUM_CAP:,.0f}.")
+_flag(epc.drop_duplicates("ContractRowID"), "Contract commission", "ContractCommission", COMM_CAP,
+      counterparty=lambda d: d["Carrier"],
+      reason=f"Contract commission above ${COMM_CAP:,.0f}. Zeroed at product grain so the "
+             "error cannot land on whichever products that contract happens to list.")
+
 _n_comm = int((ebc["total_commissions"] > COMM_CAP).sum())
 _n_lives = int((epc["Covered_Lives"] > LIVES_CAP).sum())
 _n_prem = int((contracts["Premium"] > PREMIUM_CAP).sum()) if len(contracts) else 0
+_n_ccomm = int((epc.drop_duplicates("ContractRowID")["ContractCommission"] > COMM_CAP).sum())
 
 ebc = ebc[ebc["total_commissions"] <= COMM_CAP].copy()
 epc = epc[epc["Covered_Lives"] <= LIVES_CAP].copy()
 if len(contracts):
     contracts = contracts[contracts["Premium"] <= PREMIUM_CAP].copy()
 
+# The same keying errors reach product grain through the contract join, so the
+# cap has to be applied there too. The export has always done this; the app did
+# not, which left a $6.9 BILLION commission sitting on a 170-life employer.
+_over = epc["ContractCommission"] > COMM_CAP
+epc.loc[_over, ["ProductCommission", "ContractCommission"]] = 0.0
+
+DQ_EXCLUDED = (pd.concat(DQ_ROWS, ignore_index=True).sort_values("ReportedValue", ascending=False)
+               if DQ_ROWS else pd.DataFrame(columns=["Employer", "EIN", "Field", "Counterparty",
+                                                     "ReportedValue", "Cap", "Reason"]))
+
 DQ_NOTE = (
     f"Excluded {_n_comm} commission row(s) over ${COMM_CAP:,.0f}, {_n_lives} row(s) over "
-    f"{LIVES_CAP:,.0f} covered lives, and {_n_prem} contract(s) over ${PREMIUM_CAP:,.0f} premium "
-    f"as filer keying errors. Commissions as filed totalled ${_comm_raw:,.0f} because one row "
-    f"reports $563 trillion; cleaned they total ${ebc['total_commissions'].sum():,.0f}."
+    f"{LIVES_CAP:,.0f} covered lives, {_n_prem} contract(s) over ${PREMIUM_CAP:,.0f} premium, "
+    f"and zeroed product commission on {_n_ccomm} contract(s) over ${COMM_CAP:,.0f}. "
+    f"Commissions as filed totalled ${_comm_raw:,.0f} because one row reports $563 trillion; "
+    f"cleaned they total ${ebc['total_commissions'].sum():,.0f}."
 )
 
 # Normalize products a bit (defensive)
@@ -746,24 +808,48 @@ if product_filter_note:
 with st.expander("Data quality: which rows are excluded and why"):
     st.write(DQ_NOTE)
 
-k1, k2, k3, k4, k5, k6 = st.columns(6)
+def _money(v):
+    return f"${v/1e9:.2f}B" if abs(v) >= 1e9 else f"${v/1e6:,.1f}M"
+
+
+# Voluntary-only totals, computed at product grain over the employers in view.
+# ProductCommission and ProductPremium are both already divided across the
+# products on a bundled contract, so these are additive and do not double count.
+_vb_rows = epc[epc["ProductGroup"].eq("Voluntary")
+               & epc["Employer"].isin(set(emp_view["Employer"]))]
+_vb_by_contract = _vb_rows.drop_duplicates(["Employer", "Product", "ContractRowID"])
+VB_COMM = float(_vb_by_contract["ProductCommission"].sum())
+VB_PREM = float(_vb_by_contract["ProductPremium"].sum())
+
+k1, k2, k3, k4 = st.columns(4)
 k1.metric("Employers in view", f"{int(emp_view['Employer'].nunique()):,}")
 k2.metric("Total covered lives", f"{int(emp_view['CoveredLives'].sum()):,}")
-
 _prem = float(emp_view["TotalPremium"].sum())
-k3.metric("Total premium", f"${_prem/1e9:.2f}B" if _prem >= 1e9 else f"${_prem/1e6:,.0f}M")
+k3.metric("Total premium", _money(_prem))
 _comm = float(emp_view["TotalCommissions"].sum())
-k4.metric(
-    "Total commissions",
-    f"${_comm/1e9:.2f}B" if _comm >= 1e9 else f"${_comm/1e6:,.0f}M",
-    delta=f"{_comm/_prem*100:.1f}% of premium" if _prem > 0 else None,
-    delta_color="off",
-)
+k4.metric("Total commissions", _money(_comm),
+          delta=f"{_comm/_prem*100:.1f}% of premium" if _prem > 0 else None,
+          delta_color="off")
+
+k5, k6, k7, k8 = st.columns(4)
+k5.metric("Total VB commission", _money(VB_COMM),
+          delta=f"{VB_COMM/_comm*100:.1f}% of all commission" if _comm > 0 else None,
+          delta_color="off")
+k6.metric("Total VB premium", _money(VB_PREM),
+          delta=f"{VB_COMM/VB_PREM*100:.2f}% commission rate" if VB_PREM > 0 else None,
+          delta_color="off")
 
 aon_lives = float(family_agg.loc[family_agg["Group"] == "AON", "CoveredLives"].sum())
 comp_lives = float(family_agg.loc[family_agg["Group"] == "Competitors", "CoveredLives"].sum())
-k5.metric("AON lives share (view)", f"{(aon_lives / (aon_lives + comp_lives) * 100.0):.1f}%" if (aon_lives + comp_lives) else "—")
-k6.metric("Targets eligible", f"{int(emp_view['IsTargetEligible'].sum()):,}")
+k7.metric("AON lives share (view)", f"{(aon_lives / (aon_lives + comp_lives) * 100.0):.1f}%" if (aon_lives + comp_lives) else "—")
+k8.metric("Targets eligible", f"{int(emp_view['IsTargetEligible'].sum()):,}")
+
+st.caption(
+    "VB = the voluntary line only (accident, critical illness, hospital indemnity, cancer, "
+    "legal, long term care, identity theft, pet). Both VB figures are split across the "
+    "products on a bundled contract, so they are additive; the total premium above is the "
+    "employer-level figure summed over distinct contracts."
+)
 
 st.divider()
 
@@ -771,11 +857,12 @@ st.divider()
 # =========================
 # Tabs
 # =========================
-(tab_product, tab_trend, tab_overview, tab_comp, tab_whitespace, tab_scoring,
+(tab_product, tab_trend, tab_dq, tab_overview, tab_comp, tab_whitespace, tab_scoring,
  tab_diag, tab_report, tab_ai, tab_raw) = st.tabs(
     [
         "Product Detail",
         "Trends",
+        "Data Quality",
         "Market Overview",
         "Competitive Share",
         "Product Whitespace",
@@ -794,11 +881,13 @@ st.divider()
 with tab_product:
     st.subheader("Every product, every employer - one row each")
     st.caption(
-        "Commission is reported per product: Schedule A Part 1 carries FORM_ID, so every broker "
-        "commission row resolves to one contract and therefore to that contract's products. Where a "
-        "contract lists a single product the figure is exact; where it bundles several the contract "
-        "reports one number and it is split evenly, which the Exact% column makes visible. Lives are "
-        "real per product. Premium overlaps on bundled contracts, so do not sum it for one employer."
+        "Commission and premium are both reported per contract, then divided across the products "
+        "on that contract, so every money column here is additive - summing a column gives the "
+        "real total, not a multiple of it. Where a contract lists a single product the figure is "
+        "exact; where it bundles several it is split evenly, which the Exact% column makes "
+        "visible. Covered lives cannot be split the same way (the same people are covered by "
+        "each benefit), so lives are the real per-product figure and should not be summed across "
+        "products for one employer."
     )
 
     @st.cache_data(show_spinner="Building product detail...")
@@ -812,7 +901,8 @@ with tab_product:
         by_contract = _epc.drop_duplicates(["Employer", "Product", "ContractRowID"])
         prem = (
             by_contract.groupby(["Employer", "Product"], as_index=False)
-                       .agg(Premium=("Premium", "sum"),
+                       .agg(Premium=("ProductPremium", "sum"),
+                            ContractPremium=("Premium", "sum"),
                             Commission=("ProductCommission", "sum"))
         )
         exact = (
@@ -886,7 +976,7 @@ with tab_product:
     c3.metric("Commission", f"${_c/1e9:.2f}B" if _c >= 1e9 else f"${_c/1e6:,.1f}M",
               delta=f"{_ex/_c*100:.0f}% reported exactly" if _c > 0 else None, delta_color="off")
     _p = float(view["Premium"].sum())
-    c4.metric("Premium (overlapping)", f"${_p/1e9:.2f}B" if _p >= 1e9 else f"${_p/1e6:,.0f}M",
+    c4.metric("Premium", f"${_p/1e9:.2f}B" if _p >= 1e9 else f"${_p/1e6:,.0f}M",
               delta=f"{_c/_p*100:.2f}% commission rate" if _p > 0 else None, delta_color="off")
 
     st.markdown("#### By product")
@@ -1021,23 +1111,26 @@ with tab_trend:
             st.plotly_chart(fig, use_container_width=True)
 
             st.markdown("#### Year on year")
-            years_sorted = sorted(sel["PlanYear"].unique())
+            years_sorted = [int(y) for y in sorted(sel["PlanYear"].unique())]
             first, last = years_sorted[0], years_sorted[-1]
             piv = sel.pivot_table(index="Product", columns="PlanYear", values=col, aggfunc="sum")
-            if first in piv.columns and last in piv.columns:
-                piv["Change"] = piv[last] - piv[first]
-                piv["Change%"] = (piv[last] / piv[first].replace(0, np.nan) - 1) * 100
+            # Year columns arrive as numpy ints. Streamlit serialises column_config
+            # to JSON and a numpy int key is not serialisable, so the labels have
+            # to be real Python strings before they reach st.dataframe.
+            piv.columns = [str(int(c)) for c in piv.columns]
+            fy, ly = str(first), str(last)
+            if fy in piv.columns and ly in piv.columns:
+                piv["Change"] = piv[ly] - piv[fy]
+                piv["Change%"] = (piv[ly] / piv[fy].replace(0, np.nan) - 1) * 100
             money = col in ("Commission", "Premium")
+            num_fmt = "$%,.0f" if money else "%,d"
             st.dataframe(
                 piv.reset_index().sort_values("Change%", ascending=False),
                 use_container_width=True, hide_index=True,
                 column_config={
-                    **{str(y): st.column_config.NumberColumn(
-                        str(y), format="$%,.0f" if money else "%,d") for y in years_sorted},
-                    **{y: st.column_config.NumberColumn(
-                        str(y), format="$%,.0f" if money else "%,d") for y in years_sorted},
-                    "Change": st.column_config.NumberColumn(
-                        f"{first}->{last}", format="$%,.0f" if money else "%,d"),
+                    **{str(y): st.column_config.NumberColumn(str(y), format=num_fmt)
+                       for y in years_sorted},
+                    "Change": st.column_config.NumberColumn(f"{first} to {last}", format=num_fmt),
                     "Change%": st.column_config.NumberColumn("Change %", format="%.1f%%"),
                 },
             )
@@ -1045,6 +1138,118 @@ with tab_trend:
                 f"Comparing complete plan years {first} and {last}. Employer counts are "
                 "distinct EINs, so a company that changed its filed name is still counted once."
             )
+
+
+# =========================
+# Data Quality - everything cleaned, omitted or transformed, and why
+# =========================
+with tab_dq:
+    st.subheader("What this app cleans, omits or transforms")
+    st.caption(
+        "Form 5500 is self-reported and unaudited. Nothing below is hidden - every excluded "
+        "row is listed with its reported value so you can judge the thresholds yourself."
+    )
+
+    d1, d2, d3 = st.columns(3)
+    d1.metric("Rows excluded as filer errors", f"{len(DQ_EXCLUDED):,}")
+    d2.metric("Commissions as filed", f"${_comm_raw/1e12:,.1f}T" if _comm_raw >= 1e12
+              else _money(_comm_raw))
+    d3.metric("Commissions after cleaning", _money(float(ebc['total_commissions'].sum())))
+
+    st.markdown("### 1. Rows excluded as implausible")
+    st.markdown(
+        "A handful of filings carry keying errors large enough to swamp every total. "
+        "One row reports **$563 trillion** in commissions; another puts **$6.9 billion** of "
+        "commission on a 170-life employer. These are removed from all rollups and listed here."
+    )
+    if len(DQ_EXCLUDED):
+        st.dataframe(
+            DQ_EXCLUDED.reset_index(drop=True), use_container_width=True, hide_index=True,
+            column_config={
+                "ReportedValue": st.column_config.NumberColumn("Reported value", format="%,.0f"),
+                "Cap": st.column_config.NumberColumn("Threshold", format="%,.0f"),
+            },
+        )
+        st.download_button("Download excluded rows as CSV",
+                           data=DQ_EXCLUDED.to_csv(index=False).encode("utf-8"),
+                           file_name="excluded_rows.csv", mime="text/csv", key="dl_dq")
+    else:
+        st.success("No rows exceeded the thresholds in this view.")
+
+    st.markdown("### 2. What is deliberately out of scope")
+    st.table(pd.DataFrame([
+        {"Excluded": "Medical, dental, vision",
+         "Why": "AON does not sell them. Their Schedule A checkboxes are never read and the "
+                "free-text parser drops their labels, so they never enter the pipeline."},
+        {"Excluded": "Plan years other than the one selected",
+         "Why": "A DOL release is only ~96% the year it is named for. The late and amended "
+                "tail also appears in its own release, so keeping it would double-count "
+                "across years."},
+        {"Excluded": "AD&D from the voluntary line",
+         "Why": "It is a life rider ~87% of groups already carry. Counting it as voluntary "
+                "puts penetration near 91% and hides the real opportunity. Reported "
+                "separately, never inside VB totals."},
+        {"Excluded": "Free text matching no product rule",
+         "Why": "EAP, telehealth, wellness, supplemental life and similar. Counted as no "
+                "product rather than guessed at."},
+    ]))
+
+    st.markdown("### 3. Where a single figure is split, and why")
+    st.markdown(
+        "Schedule A reports money **per contract**, not per benefit. A contract covering "
+        "life + STD + LTD reports one premium and one commission. Left alone, those repeat "
+        "on every product row and sums inflate by the number of products on the contract."
+    )
+    _mult = epc[epc["ProductsOnContract"] > 1] if "ProductsOnContract" in epc.columns else epc.iloc[0:0]
+    _raw_prem = float(epc.drop_duplicates(["Employer", "Product", "ContractRowID"])["Premium"].sum())
+    _split_prem = float(epc.drop_duplicates(["Employer", "Product", "ContractRowID"])["ProductPremium"].sum())
+    st.table(pd.DataFrame([
+        {"Measure": "Premium", "Raw (repeated)": f"${_raw_prem:,.0f}",
+         "Split (additive)": f"${_split_prem:,.0f}",
+         "Inflation avoided": f"{_raw_prem/_split_prem:.2f}x" if _split_prem else "-"},
+        {"Measure": "Commission",
+         "Raw (repeated)": f"${float(epc.drop_duplicates('ContractRowID')['ContractCommission'].sum()):,.0f}",
+         "Split (additive)": f"${float(epc.drop_duplicates(['Employer','Product','ContractRowID'])['ProductCommission'].sum()):,.0f}",
+         "Inflation avoided": "split across products on each contract"},
+    ]))
+    st.caption(
+        f"{_mult['ContractRowID'].nunique():,} contracts in this year cover more than one product. "
+        "Covered lives cannot be split the same way - the same people are covered by each "
+        "benefit - so lives use MAX per employer rather than SUM."
+    )
+
+    st.markdown("### 4. Identity and matching rules")
+    st.table(pd.DataFrame([
+        {"Rule": "Employer identity",
+         "Detail": "Keyed on EIN, not filed name. 5.9% of companies change their filed name "
+                   "between years and 1,719 names map to several EINs within one year. "
+                   "Display name is the one that company filed most often, with the EIN "
+                   "appended where two companies share a name."},
+        {"Rule": "AON composite",
+         "Detail": "Matched on AON as a whole word, plus declared subsidiaries and owned "
+                   "brands: Custom Benefit Programs, Univers Workplace, Cammack Health and "
+                   "NFP. Excludes SAMMAONS, GAONA, DATAONLINE and 'not for profit'."},
+        {"Rule": "Voluntary products",
+         "Detail": "Parsed from Schedule A free text, since there is no checkbox for them. "
+                   "Counts are a floor: a filer who left the box empty looks like they hold "
+                   "nothing."},
+        {"Rule": "Primary broker",
+         "Detail": "The broker with the largest commission on that employer's filings. "
+                   "UNKNOWN means no broker commission record, not no broker."},
+    ]))
+
+    st.markdown("### 5. Known limits")
+    for line in [
+        "Premium is populated on ~84% of Schedule A rows. A blank is an unreported figure, "
+        "not a zero, so premium-per-life is left empty rather than showing $0.",
+        "Commission is exact where a contract lists one product and split evenly where it "
+        "bundles several. The Exact% column shows which is which on every row.",
+        "The newest plan year is always partially filed. Large complex plans take extensions, "
+        "so an early pull under-represents big employers.",
+        "DOL keeps adding late and amended filings to closed years, so these figures are a "
+        "snapshot rather than a fixed truth.",
+    ]:
+        st.markdown(f"- {line}")
 
 
 # =========================

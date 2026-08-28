@@ -69,6 +69,12 @@ _AON_BRANDS = re.compile(
     r"|^CUSTON BENEFITS? PROGRAMS?\b"     # filer typo
     r"|\bUNIVERS WORKPLACE\b"             # Univers Workplace Benefits / Solutions
     r"|\bCAMMACK HEALTH\b"                # Cammack Health LLC, an Aon company
+    # NFP, acquired by Aon in 2024. Filed under ~400 regional spellings:
+    # NFP CORPORATE SERVICES (NY) LLC, NFP CA INSURANCE SERVICES INC, and so on.
+    # Anchored to the START of the name on purpose - "NFP" is also the common
+    # abbreviation for "not for profit", so matching it anywhere would sweep in
+    # unrelated non-profit sponsors and their brokers.
+    r"|^NFP\b"
 )
 
 TIER1_PATTERNS = {
