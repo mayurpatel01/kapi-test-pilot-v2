@@ -32,6 +32,7 @@ sys.path.insert(0, str(REPO_ROOT / "etl"))
 from benefits import (
     ALL_PRODUCTS, CORE_PRODUCTS, PRODUCT_GROUP, VB_TRIO, VOLUNTARY_PRODUCTS, column_suffix,
 )
+from quality import flag_contracts, summarise as summarise_quality
 from brokers import (
     TIER1_PATTERNS, TIER_LABEL, assign_tiers, broker_family, is_aon_composite,
     match_rule, norm,
@@ -211,6 +212,20 @@ def build(tier2_pct: float = 0.10, comm_cap: float = 10_000_000.0, lives_cap: fl
     if _bad_contract_comm:
         log(f"data-quality: zeroed product commission on {_bad_contract_comm} row(s) "
             f"whose contract commission exceeded ${comm_cap:,.0f}")
+
+    # Second tier of data quality: implausible but not destructive, so these stay
+    # in every total and are reported for a human to judge rather than dropped.
+    _flagged = flag_contracts(contracts)
+    quality_flags = summarise_quality(_flagged)
+    _fl = _flagged[_flagged["AnyQualityFlag"]]
+    flagged_contracts = _fl[[c for c in ["Employer", "EIN", "Carrier", "Products",
+                                         "Covered_Lives", "Premium", "Commission",
+                                         "PremiumPerLife", "QualityFlag"]
+                             if c in _fl.columns]].sort_values("Premium", ascending=False)
+    if len(flagged_contracts):
+        log(f"quality flags: {len(flagged_contracts):,} contracts kept but flagged "
+            f"(${flagged_contracts['Premium'].sum():,.0f} premium, "
+            f"${flagged_contracts['Commission'].sum():,.0f} commission)")
 
     dq = {
         "comm_raw_total": comm_raw_total,
@@ -961,6 +976,8 @@ def build(tier2_pct: float = 0.10, comm_cap: float = 10_000_000.0, lives_cap: fl
     return {
         "employers": employers,
         "company_matrix": company_matrix,
+        "quality_flags": quality_flags,
+        "flagged_contracts": flagged_contracts,
         "product_detail": product_detail,
         "commission_by_product": commission_by_product,
         "premium_by_product": premium_by_product,
@@ -1117,6 +1134,11 @@ def write_readme(writer, counts: dict, dq: dict, tier2_pct: float, with_detail: 
         ("VB_Carriers", f"{counts['vb_carriers']:,} rows. Carrier league table for voluntary products only."),
         ("Carrier_Product_Summary", f"{counts['carrier_summary']:,} rows. Carrier x product footprint by employers and lives."),
         ("Product_Whitespace", f"{counts['whitespace']:,} rows. Employer counts by product combination held (gap analysis)."),
+        ("Quality_Checks", f"{counts['quality_flags']:,} rows. Contracts whose figures are implausible but NOT "
+                            "large enough to distort totals - these are KEPT in every number in this workbook and "
+                            "listed so you can judge them. One row per check with the money involved."),
+        ("Flagged_Contracts", f"{counts['flagged_contracts']:,} rows. The individual contracts behind Quality_Checks, "
+                              "with the check each one tripped."),
         ("Data_Quality_Flags", f"{counts['data_quality_flags']:,} rows. Every source row excluded as an implausible "
                                "filer keying error, with its reported value - read this before quoting any total."),
     ]
@@ -1361,6 +1383,15 @@ def export(out_path: Path, tier2_pct: float, with_detail: bool, comm_cap: float,
         write_sheet(
             writer, d["data_quality_flags"], "Data_Quality_Flags",
             int_cols=("ReportedValue",),
+        )
+        write_sheet(
+            writer, d["quality_flags"], "Quality_Checks",
+            money_cols=("Premium", "Commission"), int_cols=("Contracts", "Employers"),
+        )
+        write_sheet(
+            writer, d["flagged_contracts"], "Flagged_Contracts",
+            money_cols=("Premium", "Commission", "PremiumPerLife"),
+            int_cols=("Covered_Lives",),
         )
 
         if with_detail:

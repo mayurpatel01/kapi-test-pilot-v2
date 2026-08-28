@@ -29,6 +29,7 @@ import plotly.express as px
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "etl"))
 from benefits import ALL_PRODUCTS, CORE_PRODUCTS, VB_TRIO, VOLUNTARY_PRODUCTS  # noqa: E402
+from quality import flag_contracts, summarise as summarise_quality  # noqa: E402
 from brokers import (  # noqa: E402
     TIER1_PATTERNS, assign_tiers, broker_family, is_aon_composite, match_any, norm,
 )
@@ -370,10 +371,25 @@ if len(contracts):
 # not, which left a $6.9 BILLION commission sitting on a 170-life employer.
 _over = epc["ContractCommission"] > COMM_CAP
 epc.loc[_over, ["ProductCommission", "ContractCommission"]] = 0.0
+# The contract table needs the same treatment, or the $563 trillion row lands in
+# the quality summary and swamps it exactly as it swamped the totals.
+if len(contracts) and "Commission" in contracts.columns:
+    contracts.loc[contracts["Commission"] > COMM_CAP, "Commission"] = 0.0
 
 DQ_EXCLUDED = (pd.concat(DQ_ROWS, ignore_index=True).sort_values("ReportedValue", ascending=False)
                if DQ_ROWS else pd.DataFrame(columns=["Employer", "EIN", "Field", "Counterparty",
                                                      "ReportedValue", "Cap", "Reason"]))
+
+# Second tier: implausible but not destructive, so these stay in every total and
+# are surfaced for a human to judge rather than dropped. Auto-removing them would
+# be the worse error - most are real money with one bad field.
+if len(contracts):
+    DQ_FLAGGED = flag_contracts(contracts)
+    DQ_FLAG_SUMMARY = summarise_quality(DQ_FLAGGED)
+else:
+    DQ_FLAGGED = pd.DataFrame(columns=["Employer", "Carrier", "Covered_Lives", "Premium",
+                                       "Commission", "QualityFlag", "AnyQualityFlag"])
+    DQ_FLAG_SUMMARY = pd.DataFrame()
 
 DQ_NOTE = (
     f"Excluded {_n_comm} commission row(s) over ${COMM_CAP:,.0f}, {_n_lives} row(s) over "
@@ -1176,7 +1192,58 @@ with tab_dq:
     else:
         st.success("No rows exceeded the thresholds in this view.")
 
-    st.markdown("### 2. What is deliberately out of scope")
+    st.markdown("### 2. Flagged but KEPT — implausible figures still in every total")
+    st.markdown(
+        "These are not large enough to destroy a total, so removing them silently would be "
+        "the bigger error: most are real money with one bad field. They stay in the numbers "
+        "and are listed here so you can judge them."
+    )
+    if len(DQ_FLAG_SUMMARY):
+        _fl = DQ_FLAGGED[DQ_FLAGGED["AnyQualityFlag"]]
+        q1, q2, q3 = st.columns(3)
+        q1.metric("Contracts flagged", f"{len(_fl):,}",
+                  delta=f"{len(_fl)/len(DQ_FLAGGED)*100:.2f}% of all contracts",
+                  delta_color="off")
+        q2.metric("Premium involved", _money(float(_fl["Premium"].sum())),
+                  delta=f"{_fl['Premium'].sum()/DQ_FLAGGED['Premium'].sum()*100:.2f}% of premium",
+                  delta_color="off")
+        q3.metric("Commission involved", _money(float(_fl["Commission"].sum())),
+                  delta=f"{_fl['Commission'].sum()/DQ_FLAGGED['Commission'].sum()*100:.2f}% of commission",
+                  delta_color="off")
+
+        st.dataframe(
+            DQ_FLAG_SUMMARY, use_container_width=True, hide_index=True,
+            column_config={
+                "Contracts": st.column_config.NumberColumn(format="%,d"),
+                "Employers": st.column_config.NumberColumn(format="%,d"),
+                "Premium": st.column_config.NumberColumn(format="$%,.0f"),
+                "Commission": st.column_config.NumberColumn(format="$%,.0f"),
+                "What it means": st.column_config.TextColumn(width="large"),
+            },
+        )
+
+        pick = st.selectbox("Inspect a check", ["(all)"] + DQ_FLAG_SUMMARY["Check"].tolist())
+        show = _fl if pick == "(all)" else _fl[_fl["QualityFlag"] == pick]
+        cols = [c for c in ["Employer", "Carrier", "Products", "Covered_Lives", "Premium",
+                            "Commission", "PremiumPerLife", "QualityFlag"] if c in show.columns]
+        st.dataframe(
+            show.nlargest(500, "Premium")[cols].reset_index(drop=True),
+            use_container_width=True, hide_index=True,
+            column_config={
+                "Covered_Lives": st.column_config.NumberColumn("Lives", format="%,d"),
+                "Premium": st.column_config.NumberColumn(format="$%,.0f"),
+                "Commission": st.column_config.NumberColumn(format="$%,.0f"),
+                "PremiumPerLife": st.column_config.NumberColumn("Prem/life", format="$%,.0f"),
+            },
+        )
+        st.caption(f"Showing the largest 500 of {len(show):,} by premium.")
+        st.download_button("Download flagged contracts as CSV",
+                           data=show[cols].to_csv(index=False).encode("utf-8"),
+                           file_name="flagged_contracts.csv", mime="text/csv", key="dl_flag")
+    else:
+        st.info("No contract-level quality flags in this view.")
+
+    st.markdown("### 3. What is deliberately out of scope")
     st.table(pd.DataFrame([
         {"Excluded": "Medical, dental, vision",
          "Why": "AON does not sell them. Their Schedule A checkboxes are never read and the "
@@ -1194,7 +1261,7 @@ with tab_dq:
                 "product rather than guessed at."},
     ]))
 
-    st.markdown("### 3. Where a single figure is split, and why")
+    st.markdown("### 4. Where a single figure is split, and why")
     st.markdown(
         "Schedule A reports money **per contract**, not per benefit. A contract covering "
         "life + STD + LTD reports one premium and one commission. Left alone, those repeat "
@@ -1218,7 +1285,7 @@ with tab_dq:
         "benefit - so lives use MAX per employer rather than SUM."
     )
 
-    st.markdown("### 4. Identity and matching rules")
+    st.markdown("### 5. Identity and matching rules")
     st.table(pd.DataFrame([
         {"Rule": "Employer identity",
          "Detail": "Keyed on EIN, not filed name. 5.9% of companies change their filed name "
@@ -1238,7 +1305,7 @@ with tab_dq:
                    "UNKNOWN means no broker commission record, not no broker."},
     ]))
 
-    st.markdown("### 5. Known limits")
+    st.markdown("### 6. Known limits")
     for line in [
         "Premium is populated on ~84% of Schedule A rows. A blank is an unreported figure, "
         "not a zero, so premium-per-life is left empty rather than showing $0.",
