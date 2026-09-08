@@ -126,7 +126,10 @@ def write_flat(tables_by_year: dict, out_dir: Path, fmt: str):
         df = pd.concat(frames, ignore_index=True)
         path = out_dir / f"{name}.{fmt}"
         if fmt == "csv":
-            df.to_csv(path, index=False)
+            # float_format keeps money literal. Without it pandas uses repr and
+            # large or tiny values export as 5.4967e+10 / 2.5e-07, which Excel
+            # and most SQL loaders then read wrongly or reject.
+            df.to_csv(path, index=False, float_format="%.2f")
         else:
             df.to_parquet(path, index=False)
         log(f"  {name}: {len(df):,} rows -> {path.name} "

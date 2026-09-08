@@ -1048,6 +1048,95 @@ def write_sheet(writer, df: pd.DataFrame, sheet: str, pct_cols=(), money_cols=()
         ws.autofilter(0, 0, len(df), len(df.columns) - 1)
 
 
+def write_definitions(writer):
+    """A definitions sheet, so the workbook explains itself away from the app."""
+    wb = writer.book
+    ws = wb.add_worksheet("Definitions")
+    writer.sheets["Definitions"] = ws
+    title = wb.add_format({"bold": True, "font_size": 16})
+    h2 = wb.add_format({"bold": True, "font_size": 12, "bg_color": "#EAF0F6"})
+    bold = wb.add_format({"bold": True, "valign": "top"})
+    wrap = wb.add_format({"text_wrap": True, "valign": "top"})
+    ws.set_column(0, 0, 26)
+    ws.set_column(1, 1, 24)
+    ws.set_column(2, 2, 78)
+
+    r = 0
+    ws.write(r, 0, "Definitions", title); r += 2
+
+    ws.write(r, 0, "Core products - from Schedule A checkboxes", h2); r += 1
+    for name, field, desc in [
+        ("Life", "WLFR_BNFT_LIFE_INSUR_IND",
+         "ALL group life on the contract, undifferentiated. Basic, supplemental, voluntary, "
+         "dependent and optional life are a single tick - the form does not separate them, so "
+         "voluntary life sits inside Core and is NOT in the voluntary totals."),
+        ("STD", "WLFR_BNFT_TEMP_DISAB_IND", "Short term / temporary disability."),
+        ("LTD", "WLFR_BNFT_LONG_TERM_DISAB_IND", "Long term disability."),
+    ]:
+        ws.write(r, 0, name, bold); ws.write(r, 1, field, wrap); ws.write(r, 2, desc, wrap); r += 1
+    r += 1
+
+    ws.write(r, 0, "Voluntary and adjacent - parsed from the OTHER free text", h2); r += 1
+    ws.write(r, 2, "No checkbox exists for any of these. WLFR_TYPE_BNFT_OTH_TEXT is a "
+                   "comma-separated list, split into individual benefits and matched against "
+                   "these rules in order. First match wins.", wrap); r += 1
+    for name, group, match, note in [
+        ("AD&D", "Adjacent", "DISMEMB, ACCIDENTAL DEATH, AD&D, ADD",
+         "Matched FIRST and kept out of Accident. A life rider ~87% of groups carry; including "
+         "it would roughly double apparent voluntary size."),
+        ("Critical Illness", "Voluntary", "CRITICAL ILL, CRIT ILL, SPECIFIED DISEASE, DREAD DISEASE", ""),
+        ("Cancer", "Voluntary", "CANCER", "Matched before hospital."),
+        ("Hospital Indemnity", "Voluntary", "HOSPITAL, HOSP INDEM, MEDICAL BRIDGE, MED BRIDGE", ""),
+        ("Accident", "Voluntary", "ACCIDENT, ACCIDENTAL INJURY, ACCDENT/ACCIDNET typos",
+         "Only reached after AD&D is removed."),
+        ("Long Term Care", "Voluntary", "LONG TERM CARE, LTC", ""),
+        ("Legal", "Voluntary", "LEGAL", ""),
+        ("Identity Theft", "Voluntary", "IDENTITY, ID THEFT", "Too few holders to model."),
+        ("Pet", "Voluntary", "PET", "Too few holders to model."),
+    ]:
+        ws.write(r, 0, name, bold)
+        ws.write(r, 1, group + " | " + match, wrap)
+        ws.write(r, 2, note, wrap); r += 1
+    r += 1
+
+    ws.write(r, 0, "Not captured", h2); r += 1
+    for line in [
+        "Medical, dental and vision - out of scope by design.",
+        "EAP, telehealth, wellness, transplant - in the free text but not insurance products "
+        "for this purpose, so they match no rule and count as nothing.",
+        "KNOWN GAP: 667 contracts carrying $160.3M of premium name voluntary, whole or "
+        "supplemental life in the free text, do NOT tick the Life checkbox, and match no other "
+        "rule - so they count as having no product and drop out entirely. Another 4,870 name a "
+        "life variant AND tick the box, so those are captured as undifferentiated Life. Adding a "
+        "Voluntary Life product would recover the 667; that is a scope decision, not a bug fix.",
+    ]:
+        ws.write(r, 2, "- " + line, wrap); r += 1
+    r += 1
+
+    ws.write(r, 0, "Column meanings", h2); r += 1
+    for col, desc in [
+        ("ProductCommission", "Broker commission resolved to a contract via (ACK_ID, FORM_ID), "
+                              "then divided across the products on it. SAFE TO SUM."),
+        ("ProductPremium", "Contract premium divided across its products. SAFE TO SUM."),
+        ("PremiumOnContracts", "The whole contract's premium repeated on each product row. Use "
+                               "for 'what is this contract worth'. NEVER SUM."),
+        ("ExactCommission / CommissionExact%", "The portion that came from a contract listing one "
+                                               "product only, so no apportioning was involved."),
+        ("CoveredLives", "Persons covered at end of year. MAX per employer, never SUM - the same "
+                         "people are covered by each benefit."),
+        ("EmployerCommissions / EmployerPremium", "Employer TOTALS repeated on every one of that "
+                                                  "employer's rows. For reconciliation, not "
+                                                  "aggregation."),
+        ("PrimaryBroker", "Broker with the largest commission on that employer's filings. UNKNOWN "
+                          "means none was filed, not that there is no broker."),
+        ("EIN", "Employer Identification Number - the employer key, stable across years where the "
+                "filed name is not."),
+        ("Opp_* columns", "MODELLED estimates of what an unsold product would be worth. Not "
+                          "reported anywhere in Form 5500. Use to rank accounts, not to forecast."),
+    ]:
+        ws.write(r, 0, col, bold); ws.write(r, 2, desc, wrap); r += 1
+
+
 def write_readme(writer, counts: dict, dq: dict, tier2_pct: float, with_detail: bool):
     wb = writer.book
     ws = wb.add_worksheet("README")
@@ -1284,6 +1373,7 @@ def export(out_path: Path, tier2_pct: float, with_detail: bool, comm_cap: float,
 
     with pd.ExcelWriter(out_path, engine="xlsxwriter") as writer:
         write_readme(writer, counts, dq, tier2_pct, with_detail)
+        write_definitions(writer)
 
         write_sheet(
             writer, d["employers"], "Employers",

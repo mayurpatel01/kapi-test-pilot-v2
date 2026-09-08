@@ -159,12 +159,18 @@ MART_COLUMNS = {
 
 
 def _read(path, filename):
-    """Read only the needed columns, then shrink numeric dtypes.
+    """Read only the needed columns, then shrink integer dtypes.
 
-    Deliberately does NOT convert strings to categoricals: Employer, Product and
-    Carrier are groupby keys, and pandas groups categoricals by every category
-    rather than the ones present, which turns a 279k-row groupby into a
-    multi-million-row cartesian product.
+    Money stays float64. float32 holds integers exactly only to 2**24
+    (16,777,216), so a $413,354,718 contract becomes $413,354,720 and column
+    totals drift - and its repr is scientific notation, which is how the drift
+    first showed up, as exponents in an exported CSV. The memory saved is not
+    worth wrong money.
+
+    Deliberately does NOT convert strings to categoricals either: Employer,
+    Product and Carrier are groupby keys, and pandas groups categoricals by
+    every category rather than the ones present, which turns a 279k-row groupby
+    into a multi-million-row cartesian product.
     """
     want = MART_COLUMNS.get(filename)
     if want:
@@ -173,8 +179,7 @@ def _read(path, filename):
         df = pd.read_parquet(path, columns=want or None)
     else:
         df = pd.read_parquet(path)
-    for c in df.select_dtypes("float64").columns:
-        df[c] = df[c].astype("float32")
+    # Integer downcasting is lossless - it only narrows when every value fits.
     for c in df.select_dtypes("int64").columns:
         df[c] = pd.to_numeric(df[c], downcast="integer")
     return df
@@ -203,6 +208,17 @@ def load_parquet(filename: str, year: int | None = None) -> pd.DataFrame:
 # norm() is imported from etl/brokers.py -- see the import block at the top.
 
 
+def to_csv_bytes(df: pd.DataFrame) -> bytes:
+    """CSV with money written in full, never in scientific notation.
+
+    pandas writes floats using repr, so a small or very large value comes out as
+    2.5e-07 or 5.4967e+10. Anything reading that as text - Excel, a SQL COPY, a
+    naive parser - either loses the value or refuses it. A fixed two-decimal
+    format keeps every figure literal and addable.
+    """
+    return df.to_csv(index=False, float_format="%.2f").encode("utf-8")
+
+
 def lazy_csv(df: pd.DataFrame, label: str, filename: str, key: str, note: str = ""):
     """Offer a CSV without building it on every rerun.
 
@@ -217,7 +233,7 @@ def lazy_csv(df: pd.DataFrame, label: str, filename: str, key: str, note: str = 
         return
     if st.checkbox(f"Prepare download - {label} ({len(df):,} rows)", key=f"{key}_prep",
                    help=note or "Builds the file now. Left off, it costs no memory."):
-        st.download_button(label, data=df.to_csv(index=False).encode("utf-8"),
+        st.download_button(label, data=to_csv_bytes(df),
                            file_name=filename, mime="text/csv", key=key)
 
 
@@ -973,11 +989,12 @@ st.divider()
 # =========================
 # Tabs
 # =========================
-(tab_product, tab_trend, tab_dq, tab_how, tab_overview, tab_comp, tab_whitespace, tab_scoring,
- tab_diag, tab_report, tab_ai, tab_raw) = st.tabs(
+(tab_product, tab_trend, tab_defs, tab_dq, tab_how, tab_overview, tab_comp, tab_whitespace,
+ tab_scoring, tab_diag, tab_report, tab_ai, tab_raw) = st.tabs(
     [
         "Product Detail",
         "Trends",
+        "Definitions",
         "Data Quality",
         "How this works",
         "Market Overview",
@@ -1278,7 +1295,7 @@ with tab_dq:
             },
         )
         st.download_button("Download excluded rows as CSV",
-                           data=DQ_EXCLUDED.to_csv(index=False).encode("utf-8"),
+                           data=to_csv_bytes(DQ_EXCLUDED),
                            file_name="excluded_rows.csv", mime="text/csv", key="dl_dq")
     else:
         st.success("No rows exceeded the thresholds in this view.")
@@ -1329,7 +1346,7 @@ with tab_dq:
         )
         st.caption(f"Showing the largest 500 of {len(show):,} by premium.")
         st.download_button("Download flagged contracts as CSV",
-                           data=show[cols].to_csv(index=False).encode("utf-8"),
+                           data=to_csv_bytes(show[cols]),
                            file_name="flagged_contracts.csv", mime="text/csv", key="dl_flag")
     else:
         st.info("No contract-level quality flags in this view.")
@@ -1408,6 +1425,111 @@ with tab_dq:
         "snapshot rather than a fixed truth.",
     ]:
         st.markdown(f"- {line}")
+
+
+# =========================
+# Definitions - what each product and column actually means
+# =========================
+with tab_defs:
+    st.subheader("Product definitions")
+    st.markdown(
+        "Every product here comes from one of two places on Schedule A, and the difference "
+        "matters: a **checkbox** is a tick the filer either made or did not, while **free text** "
+        "is whatever they typed in the OTHER box and had to be parsed."
+    )
+
+    st.markdown("### Core products — from checkboxes")
+    st.table(pd.DataFrame([
+        {"Product": "Life", "Schedule A field": "WLFR_BNFT_LIFE_INSUR_IND",
+         "What it covers": "ALL group life on that contract, undifferentiated — basic, "
+                           "supplemental, voluntary, dependent and optional life are one tick. "
+                           "The form does not separate them."},
+        {"Product": "STD", "Schedule A field": "WLFR_BNFT_TEMP_DISAB_IND",
+         "What it covers": "Short term / temporary disability."},
+        {"Product": "LTD", "Schedule A field": "WLFR_BNFT_LONG_TERM_DISAB_IND",
+         "What it covers": "Long term disability."},
+    ]))
+
+    st.warning(
+        "**On 'Life' specifically.** It is one checkbox, so you cannot tell employer-paid basic "
+        "life from employee-paid voluntary life anywhere in this data — both are simply 'Life'. "
+        "That also means voluntary life is NOT in the voluntary totals: it sits inside Core. "
+        "If VB penetration is meant to include voluntary life, these figures understate it, and "
+        "no amount of parsing fixes that because the distinction was never filed."
+    )
+
+    st.markdown("### Voluntary and adjacent products — parsed from free text")
+    st.markdown(
+        "There is no checkbox for any of these. They are written into "
+        "`WLFR_TYPE_BNFT_OTH_TEXT` as a comma-separated list — *\"ACCIDENT, CRITICAL ILLNESS, "
+        "HOSPITAL\"* — which is split into individual benefits and matched against the rules "
+        "below, in this order. First rule to match wins."
+    )
+    _rules = [
+        ("AD&D", "Adjacent", "DISMEMB, ACCIDENTAL DEATH, AD&D, ADD",
+         "Matched FIRST and deliberately kept out of Accident. It is a life rider ~87% of groups "
+         "carry; folding it in would roughly double apparent voluntary size."),
+        ("Critical Illness", "Voluntary", "CRITICAL ILL, CRIT ILL, SPECIFIED DISEASE, DREAD DISEASE", ""),
+        ("Cancer", "Voluntary", "CANCER", "Standalone cancer cover, matched before hospital so "
+                                          "'CANCER ASSIST' does not fall to another rule."),
+        ("Hospital Indemnity", "Voluntary", "HOSPITAL, HOSP INDEM, MEDICAL BRIDGE, MED BRIDGE", ""),
+        ("Accident", "Voluntary", "ACCIDENT, ACCIDENTAL INJURY, plus the ACCDENT / ACCIDNET typos",
+         "Only reached after AD&D has been taken out."),
+        ("Long Term Care", "Voluntary", "LONG TERM CARE, LTC", ""),
+        ("Legal", "Voluntary", "LEGAL", ""),
+        ("Identity Theft", "Voluntary", "IDENTITY, ID THEFT", "Too few holders to model opportunity."),
+        ("Pet", "Voluntary", "PET", "Too few holders to model opportunity."),
+    ]
+    st.table(pd.DataFrame([
+        {"Product": p, "Group": g, "Text it matches": m, "Note": n} for p, g, m, n in _rules
+    ]))
+
+    st.markdown("### What is NOT captured")
+    st.markdown(
+        "- **Medical, dental, vision** — out of scope by design; AON does not sell them.\n"
+        "- **EAP, telehealth, wellness, transplant** — appear in the free text but are not "
+        "insurance products for this purpose, so they match no rule and are counted as nothing.\n"
+        "- **Voluntary / supplemental / dependent life named only in free text** — see below."
+    )
+    st.error(
+        "**A known gap worth a decision.** 667 contracts carrying **$160.3M of premium** describe "
+        "voluntary, whole or supplemental life in the free text, do NOT have the Life checkbox "
+        "ticked, and match no other rule — so they are counted as having no product at all and "
+        "fall out of the dataset entirely. A further 4,870 contracts name a life variant AND tick "
+        "the box, so those are captured, just as undifferentiated 'Life'. "
+        "Adding a Voluntary Life product would recover the 667 and move voluntary totals up; it "
+        "is a scope decision, not a bug fix, so nothing has been changed."
+    )
+
+    st.markdown("### Column meanings")
+    st.table(pd.DataFrame([
+        {"Column": "Commission", "Means": "Broker commission from Schedule A Part 1, resolved to a "
+                                          "contract via (ACK_ID, FORM_ID), then divided across the "
+                                          "products on that contract. Safe to sum."},
+        {"Column": "Premium", "Means": "Premium received, falling back to total charges paid, "
+                                       "divided across the products on the contract. Safe to sum."},
+        {"Column": "PremiumOnContracts", "Means": "The WHOLE contract's premium repeated on each of "
+                                                  "its product rows. Use for 'what is this contract "
+                                                  "worth'. NEVER sum it."},
+        {"Column": "Exact%", "Means": "Share of a figure that came from a contract listing one "
+                                      "product only, so no splitting was involved. 100% means "
+                                      "fully reported; lower means partly apportioned."},
+        {"Column": "CoveredLives", "Means": "Persons covered at end of year. Per employer this is "
+                                            "MAX across contracts, never SUM — the same people are "
+                                            "covered by each benefit."},
+        {"Column": "PrimaryBroker", "Means": "The broker with the largest commission on that "
+                                             "employer's filings. UNKNOWN means no broker "
+                                             "commission was filed, not that there is no broker."},
+        {"Column": "BrokerFamily", "Means": "AON (including owned brands), one of the named global "
+                                            "majors, or OTHER."},
+        {"Column": "EIN", "Means": "Employer Identification Number — the employer key. Stable "
+                                   "across years where the filed name is not."},
+    ]))
+
+    st.caption(
+        "Rules live in etl/benefits.py and are shared by the dashboard and the Excel export, so "
+        "the two cannot disagree. Change a rule there and both follow."
+    )
 
 
 # =========================
