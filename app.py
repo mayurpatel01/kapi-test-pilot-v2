@@ -26,6 +26,7 @@ import pandas as pd
 import numpy as np
 import streamlit as st
 import plotly.express as px
+import pyarrow.parquet as pq
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "etl"))
 from benefits import ALL_PRODUCTS, CORE_PRODUCTS, VB_TRIO, VOLUNTARY_PRODUCTS  # noqa: E402
@@ -140,27 +141,84 @@ def available_years() -> list:
     return sorted(years, reverse=True)
 
 
+# Columns each mart actually needs. Reading the rest costs real memory for no
+# benefit - employer_product_carrier alone drops from 192 MB to 111 MB, and on a
+# 1 GB Streamlit Cloud instance that difference is the app staying up.
+MART_COLUMNS = {
+    "employer_product_carrier.parquet": [
+        "EIN", "Employer", "Product", "ProductGroup", "Carrier", "Covered_Lives",
+        "Premium", "ProductPremium", "ProductCommission", "ContractCommission",
+        "CommissionIsExact", "ContractRowID", "ProductsOnContract", "PlanYear"],
+    "employer_broker_commissions.parquet": [
+        "ACK_ID", "EIN", "Employer", "Broker", "total_commissions"],
+    "employer_contract.parquet": [
+        "ContractRowID", "ACK_ID", "EIN", "Employer", "Carrier", "Covered_Lives",
+        "Premium", "Commission", "Products", "ProductCount"],
+    "employer_geo.parquet": ["Employer", "State", "City", "ZIP", "EIN"],
+}
+
+
+def _read(path, filename):
+    """Read only the needed columns, then shrink numeric dtypes.
+
+    Deliberately does NOT convert strings to categoricals: Employer, Product and
+    Carrier are groupby keys, and pandas groups categoricals by every category
+    rather than the ones present, which turns a 279k-row groupby into a
+    multi-million-row cartesian product.
+    """
+    want = MART_COLUMNS.get(filename)
+    if want:
+        available = set(pq.ParquetFile(path).schema.names)
+        want = [c for c in want if c in available]
+        df = pd.read_parquet(path, columns=want or None)
+    else:
+        df = pd.read_parquet(path)
+    for c in df.select_dtypes("float64").columns:
+        df[c] = df[c].astype("float32")
+    for c in df.select_dtypes("int64").columns:
+        df[c] = pd.to_numeric(df[c], downcast="integer")
+    return df
+
+
 @st.cache_data(show_spinner=False)
 def load_parquet(filename: str, year: int | None = None) -> pd.DataFrame:
     """Load a mart, from the year partition when one is selected."""
     if year is not None:
         path = DATA_DIR / str(year) / filename
         if path.exists():
-            return pd.read_parquet(path)
+            return _read(path, filename)
         # employer_geo and other shared marts may only exist at the root.
         root = DATA_DIR / filename
         if root.exists():
-            return pd.read_parquet(root)
+            return _read(root, filename)
         raise FileNotFoundError(f"Missing mart: {path}")
 
     ensure_mart_exists(filename)
     path = DATA_DIR / filename
     if not path.exists():
         raise FileNotFoundError(f"Missing mart: {path}")
-    return pd.read_parquet(path)
+    return _read(path, filename)
 
 
 # norm() is imported from etl/brokers.py -- see the import block at the top.
+
+
+def lazy_csv(df: pd.DataFrame, label: str, filename: str, key: str, note: str = ""):
+    """Offer a CSV without building it on every rerun.
+
+    st.download_button needs its bytes up front, so putting a large frame
+    straight into one encodes the whole thing on EVERY script run whether or not
+    anyone clicks. The Product Detail view is ~70 MB encoded, and with several
+    such buttons that alone can exhaust a small instance. Gate it behind a
+    checkbox so the cost is paid only when the download is actually wanted.
+    """
+    if not len(df):
+        st.caption("Nothing to download in this view.")
+        return
+    if st.checkbox(f"Prepare download - {label} ({len(df):,} rows)", key=f"{key}_prep",
+                   help=note or "Builds the file now. Left off, it costs no memory."):
+        st.download_button(label, data=df.to_csv(index=False).encode("utf-8"),
+                           file_name=filename, mime="text/csv", key=key)
 
 
 def to_numeric(s: pd.Series) -> pd.Series:
@@ -544,29 +602,68 @@ with st.sidebar:
     employer_search = st.text_input("Employer search", value="").strip()
 
     st.divider()
-    st.markdown("## Tier settings")
-    tier2_pct = st.slider("Tier2 cutoff (top % of 'Other' brokers by lives)", 0.05, 0.30, 0.10, 0.01)
+    st.divider()
+    RAW_MODE = st.toggle(
+        "Raw data mode (no modelling)", value=False,
+        help="Turns off every scored, weighted or judgement-based setting below. Nothing is "
+             "filtered out and no opportunity score is applied - you get the filings as "
+             "reported, subject only to the data-quality caps. Use this when exporting for "
+             "SQL, or when you want a number you can trace straight back to a filing. "
+             "See the 'How this works' tab.",
+    )
+    if RAW_MODE:
+        st.success("Raw mode on. Tier, robustness and opportunity settings are inactive.")
 
     st.divider()
-    st.markdown("## Robustness")
-    metric_mode = st.radio("Commission aggregation", ["Median (recommended)", "Mean"], index=0, horizontal=False)
-    log_hist = st.toggle("Log scale histograms", value=True)
+    st.markdown("## Tier settings" + (" _(inactive in raw mode)_" if RAW_MODE else ""))
+    tier2_pct = st.slider("Tier2 cutoff (top % of 'Other' brokers by lives)", 0.05, 0.30, 0.10, 0.01,
+                          disabled=RAW_MODE,
+                          help="Brokers that are neither AON nor a named global major get ranked by "
+                               "covered lives; this picks how many of them count as Tier2 rather "
+                               "than Tier3. It changes labels only - no employer is added or removed.")
 
     st.divider()
-    st.markdown("## Opportunity model")
+    st.markdown("## Robustness" + (" _(inactive in raw mode)_" if RAW_MODE else ""))
+    metric_mode = st.radio("Commission aggregation", ["Median (recommended)", "Mean"], index=0,
+                           horizontal=False, disabled=RAW_MODE,
+                           help="Only affects the per-broker average shown on broker tables. "
+                                "Median resists the filer keying errors this data is full of; "
+                                "mean does not. Totals are unaffected either way.")
+    log_hist = st.toggle("Log scale histograms", value=True, disabled=RAW_MODE,
+                         help="Display only. Commission and lives span many orders of magnitude, "
+                              "so a linear axis shows one bar.")
+
+    st.divider()
+    st.markdown("## Opportunity model" + (" _(inactive in raw mode)_" if RAW_MODE else ""))
     score_mode = st.radio(
         "Target mode",
         ["Competitive takeout (AON vs competitors)", "AON cross-sell (inside AON book)"],
-        index=0
+        index=0, disabled=RAW_MODE,
+        help="Which employers are eligible to be scored. Takeout scores everyone NOT on the AON "
+             "book; cross-sell scores only those already on it. Employers outside the chosen "
+             "mode get a score of zero - they are still in every table and every total.",
     )
 
-    w_whitespace = st.slider("Weight: Product whitespace", 0.0, 5.0, 2.0, 0.1)
-    w_lives = st.slider("Weight: Covered lives (log)", 0.0, 5.0, 2.5, 0.1)
-    w_tier = st.slider("Weight: Competitor tier factor", 0.0, 5.0, 1.5, 0.1)
-    w_state_gap = st.slider("Weight: State under-index factor", 0.0, 5.0, 1.0, 0.1)
-    w_frag = st.slider("Weight: Broker fragmentation", 0.0, 5.0, 0.7, 0.1)
+    w_whitespace = st.slider("Weight: Product whitespace", 0.0, 5.0, 2.0, 0.1, disabled=RAW_MODE,
+                             help="How much a missing core product counts toward the score.")
+    w_lives = st.slider("Weight: Covered lives (log)", 0.0, 5.0, 2.5, 0.1, disabled=RAW_MODE,
+                        help="How much sheer size counts. Log scale so a 100k-life employer does "
+                             "not swamp every other factor.")
+    w_tier = st.slider("Weight: Competitor tier factor", 0.0, 5.0, 1.5, 0.1, disabled=RAW_MODE,
+                       help="How much the incumbent broker's tier counts. Tier1 globals score 0.6 "
+                            "(hard to displace), Tier3 locals 1.3 (easier).")
+    w_state_gap = st.slider("Weight: State under-index factor", 0.0, 5.0, 1.0, 0.1, disabled=RAW_MODE,
+                            help="How much it counts that AON is under-represented in that state.")
+    w_frag = st.slider("Weight: Broker fragmentation", 0.0, 5.0, 0.7, 0.1, disabled=RAW_MODE,
+                       help="How much a state with many small brokers per employer counts.")
 
-    st.caption("Tip: Start with defaults, then adjust to reflect sales strategy (Tier2/Tier3 emphasis vs Tier1).")
+    if RAW_MODE:
+        # Neutralise every weight so OpportunityScore is identically zero and no
+        # ranking is implied anywhere.
+        w_whitespace = w_lives = w_tier = w_state_gap = w_frag = 0.0
+
+    st.caption("These weights only order the Opportunity Scoring table. They never filter data, "
+               "and no total anywhere in the app depends on them.")
 
     st.divider()
     st.markdown("## Products")
@@ -772,8 +869,11 @@ emp_view["WhitespaceScore"] = emp_view.apply(compute_whitespace_score, axis=1)
 # Lives component (log transform)
 emp_view["LivesLog"] = emp_view["CoveredLives"].apply(lambda x: math.log(float(x) + 1.0))
 
-# Target eligibility based on mode
-if score_mode.startswith("Competitive"):
+# Target eligibility based on mode. In raw mode everyone is eligible and every
+# weight is zero, so the score is a flat 0 and nothing is implicitly ranked.
+if RAW_MODE:
+    emp_view["IsTargetEligible"] = True
+elif score_mode.startswith("Competitive"):
     # Target competitors only (exclude AON-incumbent employers)
     emp_view["IsTargetEligible"] = ~emp_view["BrokerFamily"].eq("AON")
 else:
@@ -873,12 +973,13 @@ st.divider()
 # =========================
 # Tabs
 # =========================
-(tab_product, tab_trend, tab_dq, tab_overview, tab_comp, tab_whitespace, tab_scoring,
+(tab_product, tab_trend, tab_dq, tab_how, tab_overview, tab_comp, tab_whitespace, tab_scoring,
  tab_diag, tab_report, tab_ai, tab_raw) = st.tabs(
     [
         "Product Detail",
         "Trends",
         "Data Quality",
+        "How this works",
         "Market Overview",
         "Competitive Share",
         "Product Whitespace",
@@ -1042,14 +1143,9 @@ with tab_product:
                for p in ALL_PRODUCTS if p in wide.columns},
         },
     )
-    st.download_button(
-        "Download company matrix as CSV",
-        data=wide.reset_index().to_csv(index=False).encode("utf-8"),
-        file_name="company_product_matrix.csv",
-        mime="text/csv",
-        key="dl_wide",
-        help="Every filtered company, not just the 1,000 shown.",
-    )
+    lazy_csv(wide.reset_index(), "Download company matrix as CSV",
+             "company_product_matrix.csv", "dl_wide",
+             note="Every filtered company, not just the 1,000 shown.")
 
     ROW_CAP = 5000
     st.markdown(f"#### Detail rows")
@@ -1074,13 +1170,8 @@ with tab_product:
         },
     )
 
-    st.download_button(
-        "Download this view as CSV",
-        data=view.to_csv(index=False).encode("utf-8"),
-        file_name="product_detail.csv",
-        mime="text/csv",
-        help="Downloads every filtered row, not just the ones displayed above.",
-    )
+    lazy_csv(view, "Download this view as CSV", "product_detail.csv", "dl_detail",
+             note="Every filtered row, not just the ones displayed above.")
 
 
 # =========================
@@ -1317,6 +1408,128 @@ with tab_dq:
         "snapshot rather than a fixed truth.",
     ]:
         st.markdown(f"- {line}")
+
+
+# =========================
+# How this works - what every sidebar control actually does
+# =========================
+with tab_how:
+    st.subheader("What the sidebar controls actually do")
+    st.markdown(
+        "Short version: **none of them add or remove data.** Every employer, every dollar and "
+        "every product row is present regardless of how these are set. They change how things "
+        "are *labelled*, *averaged* and *ordered*. The one exception is the Product filter, "
+        "which does subset the view and says so in a banner when active."
+    )
+
+    st.info(
+        "**Raw data mode** (top of the sidebar) switches all of this off in one click: no "
+        "tiering judgement, no weighted score, nothing ranked. Use it when exporting for SQL "
+        "or when you want a figure that traces straight back to a filing."
+    )
+
+    st.markdown("### Tier settings")
+    st.markdown(
+        "Brokers are sorted into four families first: **Tier0** is AON including its owned "
+        "brands (Custom Benefit Programs, Univers Workplace, Cammack Health, NFP); **Tier1** is "
+        "the named global majors (Marsh/Mercer, WTW, Gallagher, Brown & Brown); everything else "
+        "is ranked by covered lives and split into **Tier2** and **Tier3**."
+    )
+    st.markdown(
+        "The **Tier2 cutoff** slider is the only thing you control here: what share of those "
+        "'other' brokers count as Tier2 rather than Tier3. At the default 10%, the largest tenth "
+        "of independent brokers are Tier2."
+    )
+    st.warning(
+        "It relabels, it does not filter. Moving it from 10% to 30% moves brokers between two "
+        "labels; no employer appears or disappears and no total changes. It matters because "
+        "tier feeds the opportunity score - Tier3 incumbents are treated as easier to displace "
+        "than Tier1 ones."
+    )
+
+    st.markdown("### Robustness")
+    st.markdown(
+        "- **Commission aggregation (median vs mean)** — only affects the per-broker average "
+        "column on broker tables. This data is full of filer keying errors, and a mean is "
+        "dragged badly by them while a median is not. Totals never use this setting.\n"
+        "- **Log scale histograms** — display only. Commission and covered lives span several "
+        "orders of magnitude, so a linear axis collapses everything into one bar."
+    )
+
+    st.markdown("### Opportunity model")
+    st.markdown(
+        "This produces the **OpportunityScore** column on the Opportunity Scoring tab, and "
+        "nothing else. It is a ranking heuristic, not a forecast and not a dollar figure."
+    )
+    st.markdown("**Target mode** decides who is eligible to be scored:")
+    st.markdown(
+        "- *Competitive takeout* — scores employers NOT on the AON book\n"
+        "- *AON cross-sell* — scores only those already on it\n\n"
+        "Employers outside the chosen mode get a score of zero. They remain in every table and "
+        "every total; they are simply not ranked."
+    )
+    st.markdown("**The five weights** are added together into that score:")
+    st.table(pd.DataFrame([
+        {"Weight": "Product whitespace", "Default": 2.0,
+         "What it rewards": "Missing one of life / STD / LTD."},
+        {"Weight": "Covered lives (log)", "Default": 2.5,
+         "What it rewards": "Size. Log scale, so a 100k-life employer does not swamp everything."},
+        {"Weight": "Competitor tier factor", "Default": 1.5,
+         "What it rewards": "A weaker incumbent. Tier1 global scores 0.6, Tier3 local 1.3."},
+        {"Weight": "State under-index factor", "Default": 1.0,
+         "What it rewards": "States where AON holds less share than competitors."},
+        {"Weight": "Broker fragmentation", "Default": 0.7,
+         "What it rewards": "States with many small brokers per employer."},
+    ]))
+    st.caption(
+        "The units are arbitrary - a score of 12 is not 'twice as good' as 6, it is just higher "
+        "up the list. Set every weight to zero, or use Raw data mode, and the ranking disappears "
+        "while the underlying data stays exactly the same."
+    )
+
+    st.markdown("### Product filter — the one that does subset")
+    st.markdown(
+        "Unlike the above, this genuinely narrows the view, and a banner appears above the KPI "
+        "row whenever it is active. HOLDS keeps employers with the selected products; MISSING "
+        "keeps those without them. The ANY/ALL toggle flips meaning between the two: missing "
+        "ALL of accident and critical illness means holding neither, while missing ANY means "
+        "missing at least one."
+    )
+
+    st.markdown("### Getting the data out, into SQL")
+    st.markdown(
+        "The dashboard is a lens on this data, not the only way to it. If you would rather "
+        "query in SQL — or this app is struggling — export the same cleaned tables:"
+    )
+    st.code(
+        "python scripts/export_sql.py --plan-year 2024                  # one .duckdb file\n"
+        "python scripts/export_sql.py --plan-year 2024 --format csv     # one .csv per table\n"
+        "python scripts/export_sql.py --all-years   --format parquet    # every year\n\n"
+        "duckdb exports/kapi_2024.duckdb\n"
+        "  SELECT Product, SUM(Commission) FROM fact_employer_product\n"
+        "  WHERE ProductGroup = 'Voluntary' GROUP BY 1 ORDER BY 2 DESC;",
+        language="bash",
+    )
+    st.markdown(
+        "You get six tables: **fact_employer_product** (one row per employer per product — the "
+        "grain most questions are asked at), **dim_employer**, plus the underlying product, "
+        "broker and contract tables and the quality flags. The plausibility caps are applied "
+        "and premium and commission are already split per product, so the columns are additive. "
+        "Tier, robustness and opportunity settings have no effect on the export — they are "
+        "display settings and never touch the data."
+    )
+
+    st.markdown("### Where the numbers come from")
+    st.markdown(
+        "- **Commission** is reported per contract and divided across the products on that "
+        "contract. Exact where the contract lists one product, split evenly where it bundles "
+        "several — the Exact% column shows which.\n"
+        "- **Premium** works the same way. Both are safe to sum.\n"
+        "- **Covered lives** cannot be split that way, because the same people are covered by "
+        "each benefit on a contract. Lives use MAX per employer, never SUM.\n"
+        "- **Opportunity dollar figures** in the Excel export are modelled, not reported — see "
+        "the Data Quality tab."
+    )
 
 
 # =========================

@@ -364,8 +364,18 @@ def build_marts(zip_a: Path, zip_b: Path, zip_c: Path, out_dir: Path, plan_year:
         f"${_split['ProductCommission'].sum():,.0f}")
 
     # Attach employer labels
-    employer_product_carrier = b_long.merge(df_a, on="ACK_ID", how="left")
-    employer_product_carrier["Employer"] = employer_product_carrier["Employer"].fillna(employer_product_carrier["ACK_ID"].astype(str))
+    # INNER join, not left. Schedule A rows whose filing belongs to a different
+    # plan year survive the earlier plan-year filter on dataset A, and a left join
+    # keeps them with a null EIN and the ACK_ID standing in as the employer name.
+    # Measured on 2024 that was 9,908 product rows carrying $71.9M of commission
+    # and $1.35B of premium under names like "20250117120746NAL0050829170001",
+    # which then vanished from any groupby keyed on EIN.
+    _before = len(b_long)
+    employer_product_carrier = b_long.merge(df_a, on="ACK_ID", how="inner")
+    _orphans = _before - len(employer_product_carrier)
+    if _orphans:
+        log(f"  dropped {_orphans:,} Schedule A product rows with no matching "
+            f"plan-year-{plan_year} filing (orphaned by the plan-year filter)")
 
     # Save mart: employer_product_carrier
     out_epc = out_dir / "employer_product_carrier.parquet"
@@ -444,8 +454,12 @@ def build_marts(zip_a: Path, zip_b: Path, zip_c: Path, out_dir: Path, plan_year:
     )
 
     # Attach employer
-    employer_broker_commissions = broker_comm_agg.merge(df_a, on="ACK_ID", how="left")
-    employer_broker_commissions["Employer"] = employer_broker_commissions["Employer"].fillna(employer_broker_commissions["ACK_ID"].astype(str))
+    _before_c = len(broker_comm_agg)
+    employer_broker_commissions = broker_comm_agg.merge(df_a, on="ACK_ID", how="inner")
+    _orphans_c = _before_c - len(employer_broker_commissions)
+    if _orphans_c:
+        log(f"  dropped {_orphans_c:,} broker commission rows with no matching "
+            f"plan-year-{plan_year} filing")
 
     out_ebc = out_dir / "employer_broker_commissions.parquet"
     log(f"Writing {out_ebc}")
