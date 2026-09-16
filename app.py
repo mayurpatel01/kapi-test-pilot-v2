@@ -28,6 +28,9 @@ import streamlit as st
 import plotly.express as px
 import pyarrow.parquet as pq
 
+# Separator for delimited name columns. Pipe, not comma, so CSV stays clean.
+NAME_SEP = " | "
+
 sys.path.insert(0, str(Path(__file__).resolve().parent / "etl"))
 from benefits import ALL_PRODUCTS, CORE_PRODUCTS, VB_TRIO, VOLUNTARY_PRODUCTS  # noqa: E402
 from quality import flag_contracts, summarise as summarise_quality  # noqa: E402
@@ -1046,15 +1049,46 @@ with tab_product:
         )
         prem = prem.merge(exact, on=["Employer", "Product"], how="left")
         prem["ExactCommission"] = prem["ExactCommission"].fillna(0)
-        topc = (
+        _by_carrier = (
             _epc.groupby(["Employer", "Product", "Carrier"], as_index=False)
                 .agg(_l=("Covered_Lives", "max"))
                 .sort_values(["Employer", "Product", "_l"], ascending=[True, True, False])
-                .drop_duplicates(["Employer", "Product"])[["Employer", "Product", "Carrier"]]
-                .rename(columns={"Carrier": "TopCarrier"})
         )
+        topc = (_by_carrier.drop_duplicates(["Employer", "Product"])
+                [["Employer", "Product", "Carrier"]]
+                .rename(columns={"Carrier": "TopCarrier"}))
+        # The whole carrier panel, largest first, so the leading name matches
+        # TopCarrier. Pipe-separated so it survives a CSV export unquoted.
+        allc = (_by_carrier.groupby(["Employer", "Product"], as_index=False)
+                .agg(AllCarriers=("Carrier", lambda x: NAME_SEP.join(dict.fromkeys(x)))))
+
+        # Brokers resolve to a contract via (ACK_ID, FORM_ID), and a contract
+        # covers specific products - so these are the brokers on the contracts
+        # carrying THIS product, not everyone the employer uses somewhere.
+        if "ContractBrokerNames" in _epc.columns:
+            def _merge_names(series):
+                seen = []
+                for blob in series:
+                    for n in str(blob).split(NAME_SEP):
+                        n = n.strip()
+                        if n and n not in seen:
+                            seen.append(n)
+                return NAME_SEP.join(seen)
+
+            allb = (_epc[["Employer", "Product", "ContractRowID", "ContractBrokerNames",
+                          "ContractCommission"]]
+                    .drop_duplicates(["Employer", "Product", "ContractRowID"])
+                    .sort_values("ContractCommission", ascending=False)
+                    .groupby(["Employer", "Product"], as_index=False)
+                    .agg(AllBrokers=("ContractBrokerNames", _merge_names)))
+            allb["BrokersOnProduct"] = (
+                allb["AllBrokers"].map(lambda v: len(v.split(NAME_SEP)) if v else 0))
+        else:
+            allb = pd.DataFrame(columns=["Employer", "Product", "AllBrokers", "BrokersOnProduct"])
         out = (base.merge(prem, on=["Employer", "Product"], how="left")
                    .merge(topc, on=["Employer", "Product"], how="left")
+                   .merge(allc, on=["Employer", "Product"], how="left")
+                   .merge(allb, on=["Employer", "Product"], how="left")
                    .merge(emp_slim, on="Employer", how="left"))
         for c in ["Premium", "Commission", "ExactCommission", "TotalCommissions"]:
             out[c] = out[c].fillna(0)
@@ -1173,7 +1207,8 @@ with tab_product:
         view.head(ROW_CAP)[[
             "Employer", "EIN", "StateNorm", "Product", "ProductGroup", "CoveredLives",
             "Commission", "CommissionExact%", "CommissionRate%", "Premium", "PremiumPerLife",
-            "BrokerStatus", "PrimaryBroker", "BrokerFamily", "BrokerTier", "TopCarrier",
+            "BrokerStatus", "PrimaryBroker", "AllBrokers", "BrokersOnProduct",
+            "BrokerFamily", "BrokerTier", "TopCarrier", "AllCarriers",
         ]].reset_index(drop=True),
         use_container_width=True, hide_index=True,
         column_config={
@@ -1520,6 +1555,11 @@ with tab_defs:
         {"Column": "PrimaryBroker", "Means": "The broker with the largest commission on that "
                                              "employer's filings. UNKNOWN means no broker "
                                              "commission was filed, not that there is no broker."},
+        {"Column": "AllBrokers", "Means": "Every broker on the contracts carrying THIS product, "
+                                          "pipe separated, largest commission first. 48% of rows "
+                                          "name more than one, which PrimaryBroker alone hides."},
+        {"Column": "AllCarriers", "Means": "Every carrier for this product, pipe separated, "
+                                           "largest by covered lives first."},
         {"Column": "BrokerFamily", "Means": "AON (including owned brands), one of the named global "
                                             "majors, or OTHER."},
         {"Column": "EIN", "Means": "Employer Identification Number — the employer key. Stable "

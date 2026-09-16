@@ -32,6 +32,9 @@ sys.path.insert(0, str(REPO_ROOT / "etl"))
 from benefits import (
     ALL_PRODUCTS, CORE_PRODUCTS, PRODUCT_GROUP, VB_TRIO, VOLUNTARY_PRODUCTS, column_suffix,
 )
+
+# Separator for the delimited name columns. Pipe, not comma: these go to CSV.
+NAME_SEP = " | "
 from quality import flag_contracts, summarise as summarise_quality
 from brokers import (
     TIER1_PATTERNS, TIER_LABEL, assign_tiers, broker_family, is_aon_composite,
@@ -572,6 +575,51 @@ def build(tier2_pct: float = 0.10, comm_cap: float = 10_000_000.0, lives_cap: fl
            .rename(columns={"Carrier": "TopCarrier"})
     )
 
+    # ---- Every carrier and every broker on the row, not just the largest one.
+    # TopCarrier and PrimaryBroker each collapse to a single name, which hides the
+    # rest of the panel on any account with more than one. Both lists are ordered
+    # by size (carriers by covered lives, brokers by commission) so the leading
+    # name still matches the Top/Primary column, and separated by a pipe rather
+    # than a comma so they survive CSV without quoting games.
+    prod_all_carriers = (
+        epc.groupby(["Employer", "Product", "Carrier"], as_index=False)
+           .agg(_l=("Covered_Lives", "max"))
+           .sort_values(["Employer", "Product", "_l"], ascending=[True, True, False])
+           .groupby(["Employer", "Product"], as_index=False)
+           .agg(AllCarriers=("Carrier", lambda x: NAME_SEP.join(dict.fromkeys(x))))
+    )
+
+    # Brokers resolve to a CONTRACT via (ACK_ID, FORM_ID), and a contract covers
+    # specific products - so these are the brokers on the contracts that actually
+    # carry this product, not merely everyone the employer uses somewhere.
+    if "ContractBrokerNames" in epc.columns:
+        _bk = (epc[["Employer", "Product", "ContractRowID", "ContractBrokerNames",
+                    "ContractCommission"]]
+               .drop_duplicates(["Employer", "Product", "ContractRowID"])
+               .sort_values("ContractCommission", ascending=False))
+
+        def _merge_names(series):
+            seen = []
+            for blob in series:
+                for n in str(blob).split(NAME_SEP):
+                    n = n.strip()
+                    if n and n not in seen:
+                        seen.append(n)
+            return NAME_SEP.join(seen)
+
+        prod_all_brokers = (
+            _bk.groupby(["Employer", "Product"], as_index=False)
+               .agg(AllBrokers=("ContractBrokerNames", _merge_names),
+                    BrokerCountOnProduct=("ContractBrokerNames",
+                                          lambda x: len(_merge_names(x).split(NAME_SEP))
+                                          if _merge_names(x) else 0))
+        )
+    else:
+        log("WARNING: marts predate contract-level broker names - AllBrokers will be blank. "
+            "Re-run etl/build_all_years.py")
+        prod_all_brokers = pd.DataFrame(columns=["Employer", "Product", "AllBrokers",
+                                                 "BrokerCountOnProduct"])
+
     emp_cols = ["Employer", "EIN", "State", "City", "PrimaryBroker", "BrokerFamily",
                 "BrokerTier", "TotalCommissions", "TotalPremium", "CoveredLives"]
     product_detail = (
@@ -580,6 +628,8 @@ def build(tier2_pct: float = 0.10, comm_cap: float = 10_000_000.0, lives_cap: fl
         .merge(prod_sole, on=["Employer", "Product"], how="left")
         .merge(prod_comm, on=["Employer", "Product"], how="left")
         .merge(prod_top_carrier, on=["Employer", "Product"], how="left")
+        .merge(prod_all_carriers, on=["Employer", "Product"], how="left")
+        .merge(prod_all_brokers, on=["Employer", "Product"], how="left")
         .merge(employers[emp_cols].rename(columns={
             "TotalCommissions": "EmployerCommissions",
             "TotalPremium": "EmployerPremium",
@@ -627,7 +677,8 @@ def build(tier2_pct: float = 0.10, comm_cap: float = 10_000_000.0, lives_cap: fl
         "ProductPremiumShare%",
         "BrokerStatus", "AON_Is_Broker", "PrimaryBroker", "BrokerFamily", "BrokerTier",
         "EmployerCommissions", "EmployerPremium", "EmployerCoveredLives",
-        "TopCarrier", "Carriers", "Contracts",
+        "TopCarrier", "AllCarriers", "Carriers",
+        "AllBrokers", "BrokerCountOnProduct", "Contracts",
     ]].sort_values(["ProductCommission", "Employer", "Product"], ascending=[False, True, True])
 
     _pc = product_detail["ProductCommission"]
@@ -1129,6 +1180,15 @@ def write_definitions(writer):
                                                   "aggregation."),
         ("PrimaryBroker", "Broker with the largest commission on that employer's filings. UNKNOWN "
                           "means none was filed, not that there is no broker."),
+        ("AllBrokers", "Every broker on the contracts carrying THIS product, pipe separated, "
+                       "largest commission first. Brokers resolve to a contract via "
+                       "(ACK_ID, FORM_ID) and a contract covers specific products, so this is "
+                       "the panel on this product rather than everyone the employer uses. 48% of "
+                       "rows name more than one, which PrimaryBroker alone hides. It can differ "
+                       "from PrimaryBroker where the employer-wide leader is not on this "
+                       "product's contract."),
+        ("AllCarriers", "Every carrier for this product, pipe separated, largest by covered lives "
+                        "first - so the first name always equals TopCarrier."),
         ("EIN", "Employer Identification Number - the employer key, stable across years where the "
                 "filed name is not."),
         ("Opp_* columns", "MODELLED estimates of what an unsold product would be worth. Not "

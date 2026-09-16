@@ -9,6 +9,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from benefits import ALL_PRODUCTS, PRODUCT_GROUP, explode_other_text
 
 OTHER_TEXT_COL = "WLFR_TYPE_BNFT_OTH_TEXT"
+
+# Separator for multi-value name columns. A pipe, not a comma: these land in CSV
+# exports, and a comma inside a field forces quoting that some loaders mishandle.
+BROKER_SEP = " | "
 PREMIUM_COL = "WLFR_PREMIUM_RCVD_AMT"
 CHARGES_COL = "WLFR_TOT_CHARGES_PAID_AMT"
 RET_COMM_COL = "WLFR_RET_COMMISSIONS_AMT"
@@ -263,16 +267,36 @@ def build_marts(zip_a: Path, zip_b: Path, zip_c: Path, out_dir: Path, plan_year:
     df_c_early = read_zip_csv(zip_c, dtype=str)
     if "FORM_ID" in df_c_early.columns and "FORM_ID" in df_b.columns:
         df_c_early["_comm"] = safe_numeric(df_c_early["INS_BROKER_COMM_PD_AMT"])
+        df_c_early["_broker"] = df_c_early["INS_BROKER_NAME"].fillna("").astype(str).str.strip()
+
+        def _join_brokers(names):
+            """Every distinct broker on the contract, largest commission first.
+
+            A contract routinely names several brokers and only one of them is the
+            'primary'. Keeping the full list means a row can answer "who else is on
+            this account" without going back to the broker table. Deduped because
+            filers repeat a broker across Part 1 rows.
+            """
+            seen, out = set(), []
+            for n in names:
+                if n and n not in seen:
+                    seen.add(n)
+                    out.append(n)
+            return BROKER_SEP.join(out)
+
+        _ordered = df_c_early.sort_values("_comm", ascending=False)
         contract_comm = (
-            df_c_early.groupby(["ACK_ID", "FORM_ID"], as_index=False)
-                      .agg(ContractCommission=("_comm", "sum"),
-                           ContractBrokers=("INS_BROKER_NAME", "nunique"))
+            _ordered.groupby(["ACK_ID", "FORM_ID"], as_index=False)
+                    .agg(ContractCommission=("_comm", "sum"),
+                         ContractBrokers=("INS_BROKER_NAME", "nunique"),
+                         ContractBrokerNames=("_broker", _join_brokers))
         )
         before = len(df_b)
         df_b = df_b.merge(contract_comm, on=["ACK_ID", "FORM_ID"], how="left")
         assert len(df_b) == before, "contract commission join changed row count"
         df_b["ContractCommission"] = df_b["ContractCommission"].fillna(0.0)
         df_b["ContractBrokers"] = df_b["ContractBrokers"].fillna(0).astype(int)
+        df_b["ContractBrokerNames"] = df_b["ContractBrokerNames"].fillna("")
 
         joined = df_c_early.merge(df_b[["ACK_ID", "FORM_ID"]].drop_duplicates(),
                                   on=["ACK_ID", "FORM_ID"], how="inner")
@@ -285,6 +309,7 @@ def build_marts(zip_a: Path, zip_b: Path, zip_c: Path, out_dir: Path, plan_year:
             "falling back to employer grain only")
         df_b["ContractCommission"] = 0.0
         df_b["ContractBrokers"] = 0
+        df_b["ContractBrokerNames"] = ""
 
     df_b["IS_LIFE"] = coerce_indicator(df_b[ind_life]) if ind_life in df_b.columns else 0
     df_b["IS_STD"] = coerce_indicator(df_b[ind_std]) if ind_std in df_b.columns else 0
@@ -299,7 +324,8 @@ def build_marts(zip_a: Path, zip_b: Path, zip_c: Path, out_dir: Path, plan_year:
     df_b["ContractRowID"] = df_b.index.astype("int64")
 
     CARRY = ["ACK_ID", "ContractRowID", "Carrier", "Covered_Lives", "Premium",
-             "PremiumSource", "RetainedCommission", "ContractCommission", "ContractBrokers"]
+             "PremiumSource", "RetainedCommission", "ContractCommission", "ContractBrokers",
+             "ContractBrokerNames"]
 
     # Expand into long rows by product -- checkbox products first
     parts = []
@@ -401,6 +427,7 @@ def build_marts(zip_a: Path, zip_b: Path, zip_c: Path, out_dir: Path, plan_year:
             RetainedCommission=("RetainedCommission", "first"),
             Commission=("ContractCommission", "first"),
             Brokers=("ContractBrokers", "first"),
+            BrokerNames=("ContractBrokerNames", "first"),
             Products=("Product", lambda s: " + ".join(sorted(set(s)))),
             ProductCount=("Product", "nunique"),
         )
