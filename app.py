@@ -152,7 +152,11 @@ MART_COLUMNS = {
     "employer_product_carrier.parquet": [
         "EIN", "Employer", "Product", "ProductGroup", "Carrier", "Covered_Lives",
         "Premium", "ProductPremium", "ProductCommission", "ContractCommission",
-        "CommissionIsExact", "ContractRowID", "ProductsOnContract", "PlanYear"],
+        "CommissionIsExact", "ContractRowID", "ProductsOnContract", "PlanYear",
+        # Needed for the delimited broker panel. Leaving it out silently emptied
+        # AllBrokers everywhere - on screen and in the CSV - because the code that
+        # builds the panel skips itself when the column is absent.
+        "ContractBrokerNames", "ContractBrokers"],
     "employer_broker_commissions.parquet": [
         "ACK_ID", "EIN", "Employer", "Broker", "total_commissions"],
     "employer_contract.parquet": [
@@ -1085,6 +1089,15 @@ with tab_product:
             allb["BrokersOnProduct"] = (
                 allb["AllBrokers"].map(lambda v: len(v.split(NAME_SEP)) if v else 0))
         else:
+            # Never silently blank. This exact case - a column pruned at load time
+            # that the panel depends on - shipped once and looked like the feature
+            # was simply missing.
+            st.error(
+                "Broker panel unavailable: employer_product_carrier is missing "
+                "ContractBrokerNames. Either the marts predate it (re-run "
+                "`python etl/build_all_years.py`) or it was dropped by MART_COLUMNS "
+                "in this file."
+            )
             allb = pd.DataFrame(columns=["Employer", "Product", "AllBrokers", "BrokersOnProduct"])
         out = (base.merge(prem, on=["Employer", "Product"], how="left")
                    .merge(topc, on=["Employer", "Product"], how="left")
