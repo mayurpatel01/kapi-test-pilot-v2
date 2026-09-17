@@ -37,8 +37,8 @@ from benefits import (
 NAME_SEP = " | "
 from quality import flag_contracts, summarise as summarise_quality
 from brokers import (
-    TIER1_PATTERNS, TIER_LABEL, assign_tiers, broker_family, is_aon_composite,
-    match_rule, norm,
+    AON_ABSENT, AON_LEAD, AON_SECONDARY, TIER1_PATTERNS, TIER_LABEL, aon_present,
+    assign_tiers, broker_family, is_aon_composite, match_rule, norm,
 )
 
 
@@ -660,11 +660,21 @@ def build(tier2_pct: float = 0.10, comm_cap: float = 10_000_000.0, lives_cap: fl
         .replace({"nan": "", "<NA>": "", "None": ""})
     )
 
-    # The filter the whole page exists for.
-    product_detail["AON_Is_Broker"] = product_detail["BrokerFamily"].eq("AON")
-    product_detail["BrokerStatus"] = product_detail["AON_Is_Broker"].map(
-        {True: "AON is broker of record", False: "NOT AON - opportunity"}
-    )
+    # The filter the whole sheet exists for, in three states rather than two.
+    # BrokerFamily reflects the PRIMARY broker only, so a binary flag labels every
+    # account where AON is on the panel but not leading it as cold whitespace -
+    # 1,580 employers and $37.0M of AON commission in 2024.
+    product_detail["AON_Leads"] = product_detail["BrokerFamily"].eq("AON")
+    product_detail["AON_OnProduct"] = product_detail["AllBrokers"].map(aon_present)
+    product_detail["BrokerStatus"] = np.where(
+        product_detail["AON_Leads"], AON_LEAD,
+        np.where(product_detail["AON_OnProduct"], AON_SECONDARY, AON_ABSENT))
+    product_detail["AON_Is_Broker"] = (
+        product_detail["AON_Leads"] | product_detail["AON_OnProduct"])
+    _sec = int(product_detail["BrokerStatus"].eq(AON_SECONDARY).sum())
+    log(f"  AON role: {int(product_detail['AON_Leads'].sum()):,} rows lead, "
+        f"{_sec:,} present but not leading, "
+        f"{int(product_detail['BrokerStatus'].eq(AON_ABSENT).sum()):,} absent")
     product_detail["PremiumPerLife"] = (
         product_detail["PremiumOnContracts"] / product_detail["CoveredLives"].replace(0, pd.NA)
     )
@@ -675,7 +685,8 @@ def build(tier2_pct: float = 0.10, comm_cap: float = 10_000_000.0, lives_cap: fl
         "CoveredLives", "ProductCommission", "ExactCommission", "CommissionExact%",
         "ProductPremium", "PremiumOnContracts", "PremiumPerLife", "SoleProductPremium",
         "ProductPremiumShare%",
-        "BrokerStatus", "AON_Is_Broker", "PrimaryBroker", "BrokerFamily", "BrokerTier",
+        "BrokerStatus", "AON_Leads", "AON_OnProduct", "AON_Is_Broker",
+        "PrimaryBroker", "BrokerFamily", "BrokerTier",
         "EmployerCommissions", "EmployerPremium", "EmployerCoveredLives",
         "TopCarrier", "AllCarriers", "Carriers",
         "AllBrokers", "BrokerCountOnProduct", "Contracts",
@@ -827,9 +838,20 @@ def build(tier2_pct: float = 0.10, comm_cap: float = 10_000_000.0, lives_cap: fl
         .merge(wide_comm.reset_index(), on="Employer", how="left")
         .merge(opp.reset_index(), on="Employer", how="left")
     )
-    company_matrix["AON_Is_Broker"] = company_matrix["BrokerFamily"].eq("AON")
+    # Employer-level AON role, from every broker on the account rather than just
+    # the largest. An employer counts as "present" if AON appears on any of their
+    # product rows.
+    _aon_any = (product_detail.groupby("Employer")["AON_OnProduct"].any()
+                if "AON_OnProduct" in product_detail.columns else None)
+    company_matrix["AON_Leads"] = company_matrix["BrokerFamily"].eq("AON")
+    company_matrix["AON_OnAccount"] = (
+        company_matrix["Employer"].map(_aon_any).fillna(False)
+        if _aon_any is not None else False)
     company_matrix["BrokerStatus"] = np.where(
-        company_matrix["AON_Is_Broker"], "AON is broker of record", "NOT AON - opportunity")
+        company_matrix["AON_Leads"], AON_LEAD,
+        np.where(company_matrix["AON_OnAccount"], AON_SECONDARY, AON_ABSENT))
+    company_matrix["AON_Is_Broker"] = (
+        company_matrix["AON_Leads"] | company_matrix["AON_OnAccount"])
     comm_cols = [f"Comm_{column_suffix(p)}" for p in ALL_PRODUCTS]
     company_matrix["ProductsHeld"] = company_matrix[comm_cols].notna().sum(axis=1)
     company_matrix["CommissionTotal"] = company_matrix[comm_cols].sum(axis=1, min_count=1)
@@ -840,7 +862,7 @@ def build(tier2_pct: float = 0.10, comm_cap: float = 10_000_000.0, lives_cap: fl
         + comm_cols
         + ["VoluntaryOpportunity", "BiggestGap", "OpportunityConfidence", "TotalOpportunity"]
         + [f"Opp_{column_suffix(p)}" for p in ALL_PRODUCTS]
-        + ["AON_Is_Broker"]
+        + ["AON_Leads", "AON_OnAccount", "AON_Is_Broker"]
     ].sort_values("VoluntaryOpportunity", ascending=False)
 
     log(f"company matrix: {len(company_matrix):,} companies, "
@@ -1189,6 +1211,13 @@ def write_definitions(writer):
                        "product's contract."),
         ("AllCarriers", "Every carrier for this product, pipe separated, largest by covered lives "
                         "first - so the first name always equals TopCarrier."),
+        ("BrokerStatus", "AON's role on the row, derived from EVERY broker on the relevant "
+                         "contracts rather than just the largest. Three states: AON is broker of "
+                         "record; AON present, not lead; NOT AON - opportunity. The middle state "
+                         "covers 1,360 employers and 7.56M covered lives that a primary-broker-only "
+                         "flag labels as cold whitespace - ADP TotalSource, Lowe's, Disney and "
+                         "Southwest among them. Use this, not BrokerFamily, to judge whether AON "
+                         "is on an account."),
         ("EIN", "Employer Identification Number - the employer key, stable across years where the "
                 "filed name is not."),
         ("Opp_* columns", "MODELLED estimates of what an unsold product would be worth. Not "

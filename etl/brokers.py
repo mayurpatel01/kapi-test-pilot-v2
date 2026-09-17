@@ -151,3 +151,46 @@ def assign_tiers(broker_agg: pd.DataFrame, tier2_pct: float = 0.10) -> pd.DataFr
         out.loc[mask_other & (out["CoveredLives"] >= thresh), "Tier"] = "Tier2"
         out.loc[mask_other & (out["CoveredLives"] < thresh), "Tier"] = "Tier3"
     return out
+
+
+# Separator used by the delimited broker/carrier name columns in the marts.
+NAME_SEP = " | "
+
+
+def split_names(blob) -> list:
+    """Split a delimited name column back into individual broker names."""
+    if blob is None or (isinstance(blob, float) and pd.isna(blob)):
+        return []
+    return [n.strip() for n in str(blob).split(NAME_SEP) if n.strip()]
+
+
+def families_in(blob) -> set:
+    """Every broker family present in a delimited name list."""
+    return {broker_family(n) for n in split_names(blob)}
+
+
+def aon_present(blob) -> bool:
+    """Is AON on this account or contract in ANY capacity, lead or not?
+
+    The primary broker is only the largest by commission. Keying AON presence
+    off that alone mislabels every account where AON is on the panel but not
+    leading it - 1,580 employers in plan year 2024, carrying $37.0M of AON
+    commission, including Tesla, AutoZone and ADP TotalSource. Those are
+    existing relationships, not cold takeout targets.
+    """
+    return "AON" in families_in(blob)
+
+
+# Three states, because "is AON here" and "does AON lead" are different questions
+# and collapsing them loses the middle case entirely.
+AON_LEAD = "AON is broker of record"
+AON_SECONDARY = "AON present, not lead"
+AON_ABSENT = "NOT AON - opportunity"
+
+
+def aon_role(primary_broker, all_brokers_blob) -> str:
+    if broker_family(primary_broker) == "AON":
+        return AON_LEAD
+    if aon_present(all_brokers_blob):
+        return AON_SECONDARY
+    return AON_ABSENT

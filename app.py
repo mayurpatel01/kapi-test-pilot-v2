@@ -35,7 +35,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "etl"))
 from benefits import ALL_PRODUCTS, CORE_PRODUCTS, VB_TRIO, VOLUNTARY_PRODUCTS  # noqa: E402
 from quality import flag_contracts, summarise as summarise_quality  # noqa: E402
 from brokers import (  # noqa: E402
-    TIER1_PATTERNS, assign_tiers, broker_family, is_aon_composite, match_any, norm,
+    AON_ABSENT, AON_LEAD, AON_SECONDARY, TIER1_PATTERNS, aon_present, assign_tiers,
+    broker_family, is_aon_composite, match_any, norm,
 )
 
 
@@ -1096,9 +1097,17 @@ with tab_product:
         out["CommissionExact%"] = out["ExactCommission"] / out["Commission"].replace(0, np.nan) * 100.0
         out["CommissionRate%"] = out["Commission"] / out["Premium"].replace(0, np.nan) * 100.0
         out["PremiumPerLife"] = out["Premium"] / out["CoveredLives"].replace(0, np.nan)
-        out["AON_Is_Broker"] = out["BrokerFamily"].eq("AON")
-        out["BrokerStatus"] = np.where(out["AON_Is_Broker"], "AON is broker of record",
-                                       "NOT AON - opportunity")
+        # Three states, not two. BrokerFamily comes from the PRIMARY broker only,
+        # so a two-state flag calls every account where AON is on the panel but
+        # not leading it a cold opportunity - 1,580 employers and $37.0M of AON
+        # commission in 2024, Tesla and AutoZone among them.
+        out["AON_Leads"] = out["BrokerFamily"].eq("AON")
+        out["AON_OnProduct"] = out["AllBrokers"].map(aon_present)
+        out["BrokerStatus"] = np.where(
+            out["AON_Leads"], AON_LEAD,
+            np.where(out["AON_OnProduct"], AON_SECONDARY, AON_ABSENT))
+        # Kept for anything still asking the old binary question.
+        out["AON_Is_Broker"] = out["AON_Leads"] | out["AON_OnProduct"]
         out["EIN"] = (out["EIN"].astype(str).str.replace(r"\.0$", "", regex=True)
                         .replace({"nan": "", "<NA>": "", "None": ""}))
         return out
@@ -1111,11 +1120,14 @@ with tab_product:
     f1, f2, f3 = st.columns([1.2, 1.4, 1.4])
     with f1:
         broker_view = st.radio(
-            "Broker of record",
-            ["Everyone", "NOT AON (opportunity)", "AON only"],
+            "AON's role on the account",
+            ["Everyone", "NOT AON (true whitespace)", "AON present (lead or not)",
+             "AON leads", "AON present but NOT leading"],
             index=0,
-            help="AON includes its owned brands - Custom Benefit Programs, Univers Workplace, "
-                 "Cammack Health - not just names starting with 'Aon'.",
+            help="Based on EVERY broker on the product's contracts, not just the largest. "
+                 "AON includes its owned brands - Custom Benefit Programs, Univers Workplace, "
+                 "Cammack Health, NFP. 'Present but not leading' is an existing relationship to "
+                 "grow rather than a cold takeout.",
         )
     with f2:
         prod_pick = st.multiselect("Products", options=ALL_PRODUCTS, default=[],
@@ -1126,9 +1138,13 @@ with tab_product:
 
     view = pdet
     if broker_view.startswith("NOT AON"):
-        view = view[~view["AON_Is_Broker"]]
-    elif broker_view.startswith("AON only"):
-        view = view[view["AON_Is_Broker"]]
+        view = view[view["BrokerStatus"].eq(AON_ABSENT)]
+    elif broker_view.startswith("AON present ("):
+        view = view[view["BrokerStatus"].ne(AON_ABSENT)]
+    elif broker_view.startswith("AON leads"):
+        view = view[view["BrokerStatus"].eq(AON_LEAD)]
+    elif broker_view.startswith("AON present but"):
+        view = view[view["BrokerStatus"].eq(AON_SECONDARY)]
     if prod_pick:
         view = view[view["Product"].isin(prod_pick)]
     if group_pick:
@@ -1560,8 +1576,15 @@ with tab_defs:
                                           "name more than one, which PrimaryBroker alone hides."},
         {"Column": "AllCarriers", "Means": "Every carrier for this product, pipe separated, "
                                            "largest by covered lives first."},
-        {"Column": "BrokerFamily", "Means": "AON (including owned brands), one of the named global "
-                                            "majors, or OTHER."},
+        {"Column": "BrokerFamily", "Means": "Family of the PRIMARY broker only - AON (including "
+                                            "owned brands), a named global major, or OTHER."},
+        {"Column": "BrokerStatus", "Means": "AON's role, from EVERY broker on the product's "
+                                            "contracts. Three states: 'AON is broker of record' "
+                                            "(AON leads), 'AON present, not lead' (AON is on the "
+                                            "panel behind someone else - an existing relationship, "
+                                            "not a cold target), 'NOT AON - opportunity' (AON "
+                                            "absent entirely). Do not use BrokerFamily for this: "
+                                            "it sees only the largest broker."},
         {"Column": "EIN", "Means": "Employer Identification Number — the employer key. Stable "
                                    "across years where the filed name is not."},
     ]))
