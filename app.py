@@ -1215,31 +1215,67 @@ with tab_product:
              note="Every filtered company, not just the 1,000 shown.")
 
     ROW_CAP = 5000
-    st.markdown(f"#### Detail rows")
-    if len(view) > ROW_CAP:
-        st.caption(f"Showing the top {ROW_CAP:,} of {len(view):,} rows by premium. "
-                   "Narrow the filters, or use the download for the full set.")
+    st.markdown("#### Detail rows")
+
+    dv = view
+    r1, r2 = st.columns([1.4, 2.6])
+    with r1:
+        panel_only = st.checkbox(
+            "Only rows with multiple brokers", value=False,
+            help="Accounts where more than one broker sits on the contracts carrying this "
+                 "product. 48% of rows qualify, and PrimaryBroker alone hides every one of them.")
+    if panel_only:
+        dv = dv[dv["BrokersOnProduct"].fillna(0) > 1]
+    with r2:
+        wide_names = st.toggle(
+            "Show full broker / carrier lists", value=True,
+            help="On: the pipe-separated panel. Off: just the largest of each, which is the "
+                 "narrower table.")
+
+    if panel_only:
+        st.caption(f"{len(dv):,} of {len(view):,} rows have more than one broker.")
+
+    # Broker and carrier sit immediately after the employer, not buried to the
+    # right of eleven money columns where the delimited list is never seen.
+    ident = ["Employer", "EIN", "StateNorm", "Product", "ProductGroup"]
+    if wide_names:
+        panel = ["BrokerStatus", "BrokersOnProduct", "AllBrokers", "PrimaryBroker", "AllCarriers"]
+    else:
+        panel = ["BrokerStatus", "BrokersOnProduct", "PrimaryBroker", "TopCarrier"]
+    money = ["CoveredLives", "Commission", "CommissionExact%", "CommissionRate%",
+             "Premium", "PremiumPerLife"]
+    cols = ident + panel + money + ["BrokerFamily", "BrokerTier"]
+    cols = [c for c in cols if c in dv.columns]
+
     st.dataframe(
-        view.head(ROW_CAP)[[
-            "Employer", "EIN", "StateNorm", "Product", "ProductGroup", "CoveredLives",
-            "Commission", "CommissionExact%", "CommissionRate%", "Premium", "PremiumPerLife",
-            "BrokerStatus", "PrimaryBroker", "AllBrokers", "BrokersOnProduct",
-            "BrokerFamily", "BrokerTier", "TopCarrier", "AllCarriers",
-        ]].reset_index(drop=True),
+        dv.head(ROW_CAP)[cols].reset_index(drop=True),
         use_container_width=True, hide_index=True,
         column_config={
-            "StateNorm": st.column_config.TextColumn("State"),
+            "StateNorm": st.column_config.TextColumn("State", width="small"),
             "CoveredLives": st.column_config.NumberColumn("Lives", format="%,d"),
             "Commission": st.column_config.NumberColumn("Commission", format="$%,.0f"),
             "CommissionExact%": st.column_config.NumberColumn("Exact%", format="%.0f%%"),
             "CommissionRate%": st.column_config.NumberColumn("Comm rate", format="%.2f%%"),
             "Premium": st.column_config.NumberColumn(format="$%,.0f"),
             "PremiumPerLife": st.column_config.NumberColumn("Prem/life", format="$%,.0f"),
+            "BrokersOnProduct": st.column_config.NumberColumn(
+                "# brk", format="%d", width="small",
+                help="How many brokers are on the contracts carrying this product."),
+            "AllBrokers": st.column_config.TextColumn(
+                "All brokers (pipe separated)", width="large",
+                help="Every broker on the contracts carrying THIS product, largest commission "
+                     "first. PrimaryBroker is simply the first of these."),
+            "AllCarriers": st.column_config.TextColumn(
+                "All carriers (pipe separated)", width="medium",
+                help="Every carrier for this product, largest by covered lives first."),
+            "PrimaryBroker": st.column_config.TextColumn("Primary broker", width="medium"),
+            "BrokerStatus": st.column_config.TextColumn("AON role", width="medium"),
         },
     )
 
-    lazy_csv(view, "Download this view as CSV", "product_detail.csv", "dl_detail",
-             note="Every filtered row, not just the ones displayed above.")
+    lazy_csv(dv, "Download this view as CSV", "product_detail.csv", "dl_detail",
+             note="Every filtered row, not just the ones displayed above. Includes the full "
+                  "pipe-separated broker and carrier lists regardless of the toggle.")
 
 
 # =========================
