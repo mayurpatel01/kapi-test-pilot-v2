@@ -16,6 +16,12 @@ applied and premium and commission are split per product so the columns are
 additive. Nothing is filtered by tier, weight or opportunity score - those are
 display settings in the app and have no effect here.
 
+Multi-value columns (AllBrokers, AllCarriers, Products) are PIPE separated -
+" | " - not comma. A comma inside a CSV field has to be quoted, and enough
+loaders mishandle embedded quotes that it is not worth the risk. To split in
+SQL:  string_split(AllBrokers, ' | ')  in DuckDB, or SPLIT_PART / STRING_SPLIT
+elsewhere.
+
 Usage:
     python scripts/export_sql.py --plan-year 2024
     python scripts/export_sql.py --plan-year 2024 --format csv
@@ -33,6 +39,9 @@ DATA_DIR = REPO_ROOT / "data" / "marts"
 sys.path.insert(0, str(REPO_ROOT / "etl"))
 
 from quality import flag_contracts  # noqa: E402
+from brokers import (  # noqa: E402
+    AON_ABSENT, AON_LEAD, AON_SECONDARY, NAME_SEP, aon_present, broker_family,
+)
 
 COMM_CAP = 10_000_000.0
 LIVES_CAP = 1_500_000.0
@@ -76,6 +85,52 @@ def build_tables(year: int) -> dict:
                  ContractPremium=("Premium", "sum"),
                  Contracts=("ContractRowID", "nunique"),
                  Carriers=("Carrier", "nunique")))
+
+    # Names, not just counts. Without these the fact table can say an employer
+    # used three carriers but not which, which makes it useless on its own and
+    # forces a join back to the contract table for the most common question.
+    def _merge_delimited(series):
+        seen = []
+        for blob in series:
+            for n in str(blob).split(NAME_SEP):
+                n = n.strip()
+                if n and n not in seen:
+                    seen.append(n)
+        return NAME_SEP.join(seen)
+
+    carrier_names = (epc.groupby(["Employer", "Product", "Carrier"], as_index=False)
+                     .agg(_l=("Covered_Lives", "max"))
+                     .sort_values(["Employer", "Product", "_l"], ascending=[True, True, False])
+                     .groupby(["Employer", "Product"], as_index=False)
+                     .agg(AllCarriers=("Carrier", lambda x: NAME_SEP.join(dict.fromkeys(x)))))
+    fact = fact.merge(carrier_names, on=["Employer", "Product"], how="left")
+
+    if "ContractBrokerNames" in epc.columns:
+        broker_names = (by_contract.sort_values("ContractCommission", ascending=False)
+                        .groupby(["Employer", "Product"], as_index=False)
+                        .agg(AllBrokers=("ContractBrokerNames", _merge_delimited)))
+        fact = fact.merge(broker_names, on=["Employer", "Product"], how="left")
+        fact["AllBrokers"] = fact["AllBrokers"].fillna("")
+        fact["BrokersOnProduct"] = fact["AllBrokers"].map(
+            lambda v: len(v.split(NAME_SEP)) if v else 0)
+        fact["PrimaryBroker"] = fact["AllBrokers"].map(
+            lambda v: v.split(NAME_SEP)[0] if v else "UNKNOWN")
+        fact["BrokerFamily"] = fact["PrimaryBroker"].map(broker_family)
+        # Three states, from EVERY broker on the product's contracts. A
+        # primary-only flag calls an account cold whenever AON is on the panel
+        # behind a larger broker - 1,360 employers, 7.56M lives in 2024.
+        fact["AON_Leads"] = fact["BrokerFamily"].eq("AON")
+        fact["AON_OnProduct"] = fact["AllBrokers"].map(aon_present)
+        fact["BrokerStatus"] = [
+            AON_LEAD if lead else (AON_SECONDARY if on else AON_ABSENT)
+            for lead, on in zip(fact["AON_Leads"], fact["AON_OnProduct"])
+        ]
+        log(f"  fact broker roles: {int(fact['AON_Leads'].sum()):,} lead, "
+            f"{int((fact['AON_OnProduct'] & ~fact['AON_Leads']).sum()):,} present not lead")
+    else:
+        log("  WARNING: marts predate contract-level broker names; "
+            "fact_employer_product will have no broker columns")
+
     fact["PlanYear"] = year
 
     flagged = flag_contracts(con)
